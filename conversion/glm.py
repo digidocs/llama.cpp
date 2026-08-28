@@ -139,9 +139,9 @@ class Glm4MoeModel(TextModel):
 
         if is_mtp and cls.no_mtp:
             return None
-        if cls.mtp_only and not is_mtp and name not in (
+        if cls.mtp_only and not is_mtp and (cls.mtp_shared_embd or name not in (
             "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-        ):
+        )):
             return None
 
         return name, gen
@@ -293,9 +293,9 @@ class Glm4MoeLiteModel(DeepseekV2Model):
             is_mtp = match is not None and int(match.group(1)) >= cls._n_main_layers
             if is_mtp and cls.no_mtp:
                 return None
-            if cls.mtp_only and not is_mtp and name not in (
+            if cls.mtp_only and not is_mtp and (cls.mtp_shared_embd or name not in (
                 "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-            ):
+            )):
                 return None
 
         return name, gen
@@ -353,9 +353,9 @@ class GlmMoeDsaModel(DeepseekV2Model):
             return None
         # --mtp: keep ONLY NextN-block tensors plus the shared embeddings/
         # norm/lm_head (so the resulting GGUF carries just the draft head).
-        if cls.mtp_only and not is_mtp and name not in (
+        if cls.mtp_only and not is_mtp and (cls.mtp_shared_embd or name not in (
             "model.embed_tokens.weight", "model.norm.weight", "lm_head.weight",
-        ):
+        )):
             return None
 
         return name, gen

@@ -118,6 +118,7 @@ Status of each option, with what's been measured:
 |---|---|---|---|
 | ggml MUL_MAT_ID gap | - | - | **done**, the private-src1 change |
 | speculative decoding (DSpark) | low-medium | measured **+14%** | works at 200K context, not at 450K; pp unchanged; see below |
+| short-prompt pp (batched MXFP4 kernel + offload threshold) | - | 2x CPU pp for 32-1000 token prompts | **done**, see "Short prompts" |
 | fuse up + gate + swiglu on CPU | medium | ~1 ms (~2%) | measured, not built |
 | GPU small-kernel fusion | high | up to ~6 ms | not started |
 | overlap shared expert with CPU experts | high | ~4.5 ms | not started |
@@ -163,6 +164,31 @@ Required flags beyond ds4f.sh:
 **Tried and dropped:** making the private-src1 copy a `memcpy` from the shared quantized buffer (to cover bigger verify batches) was 7-11% *slower* than each thread quantizing redundantly. Every thread reading lines that 20 different cores just wrote, all at once, is costly. Raising the private-src1 limit from 32 KB to 128 KB made no measurable difference. Both reverted.
 
 Not yet tried: the Q2K-Q4K draft, `--spec-type draft-mtp` (built-in MTP head), 300K context.
+
+### Short prompts (done): batched MXFP4 kernel + offload threshold
+Time to first token for chat follow-ups was dominated by prompt processing of *short* prompts. There was no other lag: in a timed two-turn chat (`chat_timing.py` style client), wall time = server prompt time + generation time to within 0.05 s. A 197-token follow-up took 7.1 s (28 t/s).
+
+Two paths, both slow for short prompts:
+- **GPU offload** (default for batches >= 32 tokens): the used expert weights are copied over PCIe per ubatch, 3-9 s even for 32-500 tokens. Efficient only for long prompts.
+- **CPU path**: was a flat ~40 t/s, compute bound (a 256-token batch reads ~140 GB of experts, ~1.3 s at full bandwidth, but took 6.3 s). `vec_dot` unpacked every 4-bit block again for every token.
+
+Fixes:
+1. **`ggml_vec_dot_mxfp4_q8_0_rows`** (x86 AVX-512 VNNI, `arch/x86/quants.c`; generic fallback in `quants.c`, mapped in `arch-fallback.h` for other archs): one weight row against up to 8 tokens. Each pair of mxfp4 blocks is unpacked once and reused for all tokens. Tokens are repacked once per call (q8 values contiguous, scales pre-broadcast) so the per-token inner loop is load, sign, `vpdpbusd`, convert, scale. Uses zmm, since this path is compute bound. Called from `ggml_compute_forward_mul_mat_id_one_chunk` for experts with 2+ tokens when the batch has >= `GGML_MXFP4_ROWS_MIN_BATCH` (16) tokens. Decode and speculative verify batches keep the plain ymm `vec_dot`: with only 1-3 tokens per expert the new path was 1-5% slower there. MXFP4 also uses 64-row chunks so the repack is amortized.
+2. **`GGML_OP_OFFLOAD_MIN_BATCH=768`** in both launch scripts: batches below 768 tokens run the experts on the CPU instead of copying them to the GPU.
+
+| prompt tokens | GPU offload | CPU before | CPU after |
+|---|---|---|---|
+| 32 | 9.6 t/s | 35 | **48** |
+| 64 | 13.7 | 36 | **59** |
+| 128 | 20.9 | 40 | **69** |
+| 256 | 34.2 | 41 | **74** |
+| 512 | 58 | 39 | **78** |
+| 1024 | **102** | 40 | 79 |
+| 2048 | **177** | 40 | 79 |
+
+(llama-bench, 20 threads; the CPU columns use `GGML_OP_OFFLOAD_MIN_BATCH=100000`.) Real-weight harness, expert part only: 128 tokens 72.7 -> 41.4 ms/layer, 256 tokens 139.7 -> 71.3 ms/layer; 2-16 tokens unchanged within ~1%. Decode A/B: unchanged (15.3 vs 15.3 t/s on the same, somewhat noisy, runs). All 945 CPU `MUL_MAT_ID` tests and 74 MXFP4 CUDA comparisons pass. Long prompts are unaffected, because 4096-token ubatches still offload.
+
+`scripts/` holds copies of the launch scripts `~/ds4f.sh` and `~/ds4f-dspark.sh`.
 
 ### 3. CPU expert fusion: measured, small
 The matmul loops already run at ~114 GB/s of ~122, and re-sweeping prefetch after the private-src1 fix confirms 2048 is still best (1-6 KB all within 2%). Fusing up + gate + swiglu into one pass would remove one quantize, one routing + barrier, one barrier wait and the GLU pass: ~25 us/layer, **~1 ms/token**. The barrier after down stays. Worth more under speculative decoding (batches of 2+ share the fused pass), but still small. The fusion hook is `ggml_cpu_try_fuse_ops` in `ggml-cpu.c`. The graph order per layer is `MUL_MAT_ID(up)`, `MUL_MAT_ID(gate)`, `GLU(swiglu_clamp)`, `MUL_MAT_ID(down)`. The clamp limit comes from `swiglu_clamp_exp`, see `build_moe_ffn` in `src/llama-graph.cpp`.

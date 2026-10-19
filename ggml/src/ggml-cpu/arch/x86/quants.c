@@ -1149,6 +1149,110 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = sumf;
 }
 
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512DQ__)
+// max tokens per pass: their accumulators stay in zmm registers
+#define MXFP4_ROWS_NT 8
+// max blocks per row for the repacked token buffers (8 tokens x 256 blocks x 64 bytes = 128 KB on the stack)
+#define MXFP4_ROWS_NB 256
+
+// one pass of ggml_vec_dot_mxfp4_q8_0_rows over nt (<= MXFP4_ROWS_NT) tokens. The tokens were repacked by the caller:
+// yq[t] holds the q8 values contiguously and yd[t] the q8 scale of each block replicated 8x, so two blocks are one zmm load.
+// Each pair of mxfp4 blocks is unpacked once and reused for all nt tokens (the batch is compute bound, not memory bound).
+static inline __attribute__((always_inline)) void mxfp4_q8_0_rows_pass(
+        int nb, const char * GGML_RESTRICT vx, size_t bx, int nrows,
+        const int8_t * const * yq, const float * const * yd, float * const * s, const int nt) {
+    const __m512i abs_lut = _mm512_set1_epi64(0x0c08060403020100LL);
+    const __m512i m4b     = _mm512_set1_epi8(0x0f);
+    const __m512i msign   = _mm512_set1_epi8(0x08);
+
+    for (int r = 0; r < nrows; ++r) {
+        const block_mxfp4 * GGML_RESTRICT x = (const block_mxfp4 *) (vx + r*bx);
+
+        __m512 acc[MXFP4_ROWS_NT];
+        for (int t = 0; t < nt; ++t) {
+            acc[t] = _mm512_setzero_ps();
+        }
+
+        for (int ib = 0; ib < nb; ib += 2) {
+#if GGML_MXFP4_PF_DIST > 0
+            _mm_prefetch((const char *) (x + ib) + GGML_MXFP4_PF_DIST, _MM_HINT_T0);
+#endif
+            const __m256i q01 = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *) x[ib].qs)),
+                                                        _mm_loadu_si128((const __m128i *) x[ib + 1].qs), 1);
+            const __m512i qq  = _mm512_shuffle_i64x2(_mm512_castsi256_si512(q01), _mm512_castsi256_si512(q01), 0x50);
+            const __m512i nib = _mm512_and_si512(_mm512_mask_blend_epi64(0xCC, qq, _mm512_srli_epi16(qq, 4)), m4b);
+            const __m512i ax  = _mm512_shuffle_epi8(abs_lut, nib);
+            const __mmask64 neg = _mm512_test_epi8_mask(nib, msign);
+            const __m512  dx  = _mm512_insertf32x8(_mm512_set1_ps(GGML_CPU_E8M0_TO_FP32_HALF(x[ib].e)),
+                                                   _mm256_set1_ps(GGML_CPU_E8M0_TO_FP32_HALF(x[ib + 1].e)), 1);
+
+            for (int t = 0; t < nt; ++t) {
+                const __m512i yy = _mm512_loadu_si512((const __m512i *) (yq[t] + ib*QK8_0));
+                const __m512i sy = _mm512_mask_sub_epi8(yy, neg, _mm512_setzero_si512(), yy);
+                const __m512  p  = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sy)),
+                                                 _mm512_loadu_ps(yd[t] + ib*8));
+                acc[t] = _mm512_fmadd_ps(p, dx, acc[t]);
+            }
+        }
+
+        for (int t = 0; t < nt; ++t) {
+            s[t][r] = _mm512_reduce_add_ps(acc[t]);
+        }
+    }
+}
+#endif
+
+void ggml_vec_dot_mxfp4_q8_0_rows(int n, const void * GGML_RESTRICT vx, size_t bx, int nrows, const void * const * vy, float * const * s, int ny) {
+    assert(n % QK_MXFP4 == 0);
+
+    const int nb = n / QK_MXFP4;
+
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512DQ__)
+    // repacked tokens: 32 q8 values + 8 replicated scales per block
+    if (nb % 2 == 0 && nb <= MXFP4_ROWS_NB) {
+        int8_t ybuf_q[MXFP4_ROWS_NT*MXFP4_ROWS_NB*QK8_0];
+        float  ybuf_d[MXFP4_ROWS_NT*MXFP4_ROWS_NB*8];
+
+        for (int t0 = 0; t0 < ny; t0 += MXFP4_ROWS_NT) {
+            const int nt = MIN(MXFP4_ROWS_NT, ny - t0);
+
+            const int8_t * yq[MXFP4_ROWS_NT];
+            const float  * yd[MXFP4_ROWS_NT];
+            for (int t = 0; t < nt; ++t) {
+                const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy[t0 + t];
+                int8_t * q = ybuf_q + (size_t) t*nb*QK8_0;
+                float  * d = ybuf_d + (size_t) t*nb*8;
+                for (int ib = 0; ib < nb; ++ib) {
+                    memcpy(q + ib*QK8_0, y[ib].qs, QK8_0);
+                    _mm256_storeu_ps(d + ib*8, _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib].d)));
+                }
+                yq[t] = q;
+                yd[t] = d;
+            }
+
+            float * const * st = s + t0;
+            switch (nt) {
+                case 1: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 1); break;
+                case 2: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 2); break;
+                case 3: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 3); break;
+                case 4: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 4); break;
+                case 5: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 5); break;
+                case 6: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 6); break;
+                case 7: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 7); break;
+                default: mxfp4_q8_0_rows_pass(nb, (const char *) vx, bx, nrows, yq, yd, st, 8); break;
+            }
+        }
+        return;
+    }
+#endif
+
+    for (int r = 0; r < nrows; ++r) {
+        for (int t = 0; t < ny; ++t) {
+            ggml_vec_dot_mxfp4_q8_0(n, &s[t][r], 0, (const char *) vx + r*bx, 0, vy[t], 0, 1);
+        }
+    }
+}
+
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

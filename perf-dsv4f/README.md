@@ -190,6 +190,23 @@ Fixes:
 
 `scripts/` holds copies of the launch scripts `~/ds4f.sh` and `~/ds4f-dspark.sh`.
 
+### Long prompts: measured, overlap in progress
+pp4096 = 284 t/s = ~14.4 s per 4096-token ubatch. nsys of one ubatch:
+
+| | time |
+|---|---|
+| expert weight copies, 125.7 GB H2D in 3946 copies | 10.20 s (12.33 GB/s while active) |
+| GPU compute (flash attn 1.48 s, mul_mat_q 1.00 s, ...) | 3.85 s |
+| overlap between them | **0.00 s** |
+
+- PCIe runs Gen3 x16 under load (it idles at Gen1); pinned H2D peaks at 12.38 GB/s, so the copies are already link-bound.
+- Why there's no overlap: `llama_context::sched_copy_experts` (the `ggml_backend_sched` copy callback) uploads only the experts a batch uses. It reads the router ids back with a synchronize, so a layer's experts can't start uploading before its router has run. The scheduler also waits for the previous split before overwriting a split's input copy, since the allocator reuses that memory.
+- ubatch 8192: 413 t/s (+46%) at small context, but the compute buffer doubles (2.66 -> 5.32 GB at 8K ctx; ~12 GB at 450K). Dead end: out of memory.
+- `--moe-cache-mib 1024` (existing LRU device cache for host experts) at 450K: out of memory on the first prompt (VRAM 24.0 GB after load). It would hold < 1% of the experts anyway.
+- The partial last ubatch of a long prompt costs nearly a full copy. With `GGML_OP_OFFLOAD_MIN_BATCH=768`, tails under 768 tokens run on the CPU at ~78 t/s instead.
+
+Remaining options: overlap uploads with compute (prefetch the next expert matrix into a dedicated device buffer; needs ~1.2 GB+ VRAM, so it fits the 200K config but not 450K; up to ~+36%), or hybrid prefill (the idle CPU computes a share of the experts while the GPU does the rest; no VRAM cost, ~+20-25%, very high effort).
+
 ### 3. CPU expert fusion: measured, small
 The matmul loops already run at ~114 GB/s of ~122, and re-sweeping prefetch after the private-src1 fix confirms 2048 is still best (1-6 KB all within 2%). Fusing up + gate + swiglu into one pass would remove one quantize, one routing + barrier, one barrier wait and the GLU pass: ~25 us/layer, **~1 ms/token**. The barrier after down stays. Worth more under speculative decoding (batches of 2+ share the fused pass), but still small. The fusion hook is `ggml_cpu_try_fuse_ops` in `ggml-cpu.c`. The graph order per layer is `MUL_MAT_ID(up)`, `MUL_MAT_ID(gate)`, `GLU(swiglu_clamp)`, `MUL_MAT_ID(down)`. The clamp limit comes from `swiglu_clamp_exp`, see `build_moe_ffn` in `src/llama-graph.cpp`.
 

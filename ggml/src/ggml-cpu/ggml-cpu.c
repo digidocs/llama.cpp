@@ -1473,6 +1473,12 @@ UseGgmlGemm2:;
 
 // ggml_compute_forward_mul_mat_id
 
+// batches (tokens) from which mxfp4 experts with 2+ tokens use ggml_vec_dot_mxfp4_q8_0_rows; smaller batches
+// (decode, speculative verify) are memory bound and the plain vec_dot is slightly faster there
+#ifndef GGML_MXFP4_ROWS_MIN_BATCH
+#define GGML_MXFP4_ROWS_MIN_BATCH 16
+#endif
+
 static int ggml_cpu_prof_enabled;
 static int64_t ggml_cpu_prof_mmid[6]; // quantize src1, route + barrier, expert loop, calls, chunk time, rows
 static int64_t ggml_cpu_prof_thr[GGML_MAX_N_THREADS][3]; // per thread: unused, chunk time, op time
@@ -1506,6 +1512,26 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    // mxfp4 with several tokens per expert: unpack each weight block once for up to 8 tokens
+    if (type == GGML_TYPE_MXFP4 && ids->ne[1] >= GGML_MXFP4_ROWS_MIN_BATCH && ir1_end - ir1_start >= 2) {
+        const void * vy[64];
+        float      * vs[64];
+        for (int64_t b1 = ir1_start; b1 < ir1_end; b1 += 64) {
+            const int ny = (int) MIN(64, ir1_end - b1);
+            for (int t = 0; t < ny; ++t) {
+                const struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, b1 + t);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                vy[t] = (const char *) wdata + (src1_cont || src1->type != vec_dot_type
+                        ? (i11 + i12*ne11)*row_size
+                        : (i11*nb11 + i12*nb12));
+                vs[t] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2)) + ir0_start;
+            }
+            ggml_vec_dot_mxfp4_q8_0_rows(ne00, src0_cur + ir0_start*nb01, nb01, (int) (ir0_end - ir0_start), vy, vs, ny);
+        }
+        return;
+    }
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1776,7 +1802,8 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t nr1 = cne1;
 
         int chunk_size = 16;
-        if (nr0 == 1 || nr1 == 1) {
+        if (nr0 == 1 || nr1 == 1 || type == GGML_TYPE_MXFP4) {
+            // mxfp4: bigger row chunks so the per-token repack in ggml_vec_dot_mxfp4_q8_0_rows is amortized
             chunk_size = 64;
         }
 

@@ -3752,6 +3752,44 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// DeepSeek V4 hyper-connection gate: s*sigmoid(x*m + c) + b, built as MUL -> ADD -> SIGMOID -> SCALE with m a scalar
+// and c a row vector; runs as one kernel (bit-identical to the four kernels, see dsv4-hc.cu). The view of c sits between
+// MUL and ADD in the node list, so the four ops are matched by skipping view/no-op nodes; returns the last node index
+static int ggml_cuda_match_dsv4_hc_gate(const ggml_cgraph * cgraph, int i) {
+    int idx[4];
+    int n = 0;
+    for (int j = i; j < cgraph->n_nodes && n < 4; ++j) {
+        if (j > i && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            continue;
+        }
+        idx[n++] = j;
+    }
+    const enum ggml_op ops[4] = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
+    if (n < 4 || !ggml_can_fuse_ext(cgraph, idx, ops, 4)) {
+        return -1;
+    }
+    const ggml_tensor * mul = cgraph->nodes[idx[0]];
+    const ggml_tensor * add = cgraph->nodes[idx[1]];
+    const ggml_tensor * sig = cgraph->nodes[idx[2]];
+    const ggml_tensor * sc  = cgraph->nodes[idx[3]];
+
+    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+            add->src[0] != mul || sig->src[0] != add || sc->src[0] != sig) {
+        return -1;
+    }
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * m = mul->src[1];
+    const ggml_tensor * c = add->src[1];
+    if (x->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F32 || c->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 ||
+            ggml_nelements(m) != 1 || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+            c->ne[0] != x->ne[0] || ggml_nrows(c) != 1 || c->nb[0] != sizeof(float) ||
+            !ggml_are_same_shape(x, sc) || !ggml_is_contiguous(sc)) {
+        return -1;
+    }
+    const int out_nodes[] = { idx[3] };
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, i, idx[3] - i + 1, out_nodes, 1) ? idx[3] : -1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -3759,6 +3797,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL) {
+        const int last = ggml_cuda_match_dsv4_hc_gate(cgraph, i);
+        if (last > 0) {
+            ggml_tensor * scale = cgraph->nodes[last];
+            ggml_cuda_op_dsv4_hc_gate(*cuda_ctx, node, scale->src[0]->src[0], scale);
+            return last - i;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

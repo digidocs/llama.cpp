@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_COMP_POOL,
 
         GGML_OP_UNARY,
 
@@ -2700,6 +2701,21 @@ extern "C" {
             struct ggml_tensor  * base,
             float                 eps,
             int32_t               n_iter);
+
+    // comp_pool: softmax-weighted pooling of compressor state rows (DeepSeek V4 CSA/HCA compression)
+    //   kv, score [w, n_rows] (f32), idxs [J*n_blocks] (i32) -> [n_embd, 1, n_blocks]
+    //   overlap == 0: w = n_embd, J = ratio entries per block, entry j of block b reads row idxs[b*ratio + j]
+    //   overlap != 0: w = 2*n_embd, J = 2*ratio, entries j < ratio read the first half of row idxs[b*ratio + j],
+    //                 entries ratio + j the second half of row idxs[ratio*n_blocks + b*ratio + j];
+    //                 row index n_rows is an implicit extra row with kv = 0 and score = -inf
+    //   result[e, b] = sum_j kv_j[e]*softmax_j(score_j[e])
+    GGML_API struct ggml_tensor * ggml_dsv4_comp_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * idxs,
+            int32_t               ratio,
+            bool                  overlap);
 
     // hc_pre: x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
     //   result[i, t] = sum_h x[i, h, t]*weights[h, t]

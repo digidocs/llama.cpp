@@ -11736,6 +11736,70 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_dsv4_comp_pool
+
+void ggml_compute_forward_dsv4_comp_pool(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kv    = dst->src[0];
+    const ggml_tensor * score = dst->src[1];
+    const ggml_tensor * idxs  = dst->src[2];
+
+    GGML_ASSERT(kv->type == GGML_TYPE_F32 && score->type == GGML_TYPE_F32 && idxs->type == GGML_TYPE_I32);
+
+    const int32_t ratio   = ggml_get_op_params_i32(dst, 0);
+    const bool    overlap = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_blocks = dst->ne[2];
+    const int64_t n_rows   = kv->ne[1];
+    const int64_t n_read   = (int64_t) ratio*n_blocks;
+    const int64_t n_per_b  = overlap ? 2*ratio : ratio;
+
+    const int32_t * ids = (const int32_t *) idxs->data;
+
+    std::vector<float> s(n_per_b);
+    std::vector<float> v(n_per_b);
+
+    // one (block, element) pair per work item
+    const int64_t n_items = n_blocks*n_embd;
+    const int64_t i0 = (n_items*params->ith)/params->nth;
+    const int64_t i1 = (n_items*(params->ith + 1))/params->nth;
+
+    for (int64_t it = i0; it < i1; ++it) {
+        const int64_t b = it/n_embd;
+        const int64_t e = it%n_embd;
+
+        float max = -INFINITY;
+        for (int64_t j = 0; j < n_per_b; ++j) {
+            const bool    second = j >= ratio;
+            const int64_t row    = second ? ids[n_read + b*ratio + (j - ratio)] : ids[b*ratio + j];
+            const int64_t col    = second ? n_embd + e : e;
+            if (row >= n_rows) {
+                v[j] = 0.0f;
+                s[j] = -INFINITY;
+            } else {
+                v[j] = *(const float *) ((const char *) kv->data    + row*kv->nb[1]    + col*sizeof(float));
+                s[j] = *(const float *) ((const char *) score->data + row*score->nb[1] + col*sizeof(float));
+            }
+            max = std::max(max, s[j]);
+        }
+
+        float sum = 0.0f;
+        for (int64_t j = 0; j < n_per_b; ++j) {
+            s[j] = expf(s[j] - max);
+            sum += s[j];
+        }
+
+        float acc = 0.0f;
+        for (int64_t j = 0; j < n_per_b; ++j) {
+            acc += v[j]*(s[j]/sum);
+        }
+
+        *(float *) ((char *) dst->data + b*dst->nb[2] + e*dst->nb[0]) = acc;
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

@@ -9,5 +9,5 @@ export GGML_OP_OFFLOAD_MIN_BATCH=768
 --threads 20 --threads-batch 20 --cpu-range 0-19 \
 --cpu-range-batch 0-19 --cpu-strict 1 --cpu-strict-batch 1 \
 -md models/unsloth/DeepSeek-V4-Flash-0731-GGUF/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
---spec-type draft-dspark --spec-draft-n-max 3 --spec-draft-n-ubatch 512 -ngld 999 -ncmoed 999 \
+--spec-type draft-dspark --spec-draft-n-max 1 --spec-draft-n-ubatch 512 -ngld 999 -ncmoed 999 \
 -td 20 -tbd 20 --cpu-range-draft 0-19 -Cbd 0xFFFFF --cpu-strict-draft 1

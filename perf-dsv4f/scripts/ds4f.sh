@@ -6,5 +6,5 @@ export GGML_OP_OFFLOAD_MIN_BATCH=768
 --host 0.0.0.0 --port 8001 --jinja --n-gpu-layers 999 -ncmoe 999 \
 --batch-size 4096 --ubatch-size 4096 -c 450000 -np 1 \
 --flash-attn on --temp 1.0 --top-p 1.0 --min-p 0.01 -v -lv 4 -lm none \
---threads 20 --threads-batch 16 --cpu-range 0-19 \
---cpu-range-batch 0-23 --cpu-strict 1 --cpu-strict-batch 1
+--threads 20 --threads-batch 20 --cpu-range 0-19 \
+--cpu-range-batch 0-19 --cpu-strict 1 --cpu-strict-batch 1

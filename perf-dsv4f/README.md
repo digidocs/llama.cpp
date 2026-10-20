@@ -4,6 +4,24 @@ Branch: `perf/dsv4-flash-profile` (based on master `ff5a23376`)
 
 Goal: more decode tokens/s for `~/ds4f.sh` (UD-Q8_K_XL, experts MXFP4 on CPU via `-ncmoe 999`, dense BF16/Q8 on the RTX 3090) without losing precision, prompt processing speed, or VRAM (need >= 100K context with MTP).
 
+## Current status (final benchmark, commit 58762b174)
+
+Recommended: **`~/ds4f-q4.sh`** (UD-Q4_K_XL, 450K context, ub 6144, 20 threads, `GGML_OP_OFFLOAD_MIN_BATCH=768`).
+
+| | context | VRAM | pp (9K prompt) | tg |
+|---|---|---|---|---|
+| start: Q8_K_XL, master | 450K | 23.0 GB | 207 t/s | 11.0 (bench) |
+| `ds4f-q4.sh` (server) | 450K | 20.7 GB | **271 t/s** | **18.55 t/s** |
+| `ds4f-q4-dspark.sh` (server, DSpark n-max 2) | 450K | 21.9 GB | 263 t/s | 18.31 t/s (75% acceptance) |
+
+llama-bench (Q4_K_XL, 20 threads, `-lm none`): pp4096 290 t/s at ub 4096 and 6144; tg128 18.48 +- 0.51 (ub 4096) / 18.38 +- 0.51 (ub 6144). With `-lm mmap`, tg128 is 18.86 +- 0.03.
+
+DSpark no longer pays off: the bit-exact GPU work sped up plain decode (server 16.7 -> 18.55 t/s at the same settings) more than speculative decoding, whose verify batches are dominated by the CPU expert reads. It is now within noise of no draft, and costs 1.2 GB of VRAM and a little pp.
+
+Decode progress, all without precision loss beyond the model quant: 11.04 (master, Q8_K_XL) -> 16.10 (CPU expert fixes) -> 17.8 (Q4_K_XL) -> 18.86 t/s (bit-exact GPU fusions + quantize reuse), llama-bench.
+
+Remaining options, by size: overlap of the shared expert on the GPU with the CPU routed experts (~4.5 ms/token, ~+8%, scheduler work); rms_norm fusions (~0.6 ms total, three separate bit-exact fusions of about 0.4% each); everything else is small.
+
 ## Hardware
 
 - Xeon Gold 6212U, 24C/48T, 1 socket, 6x 32 GB DDR4 (all channels populated)

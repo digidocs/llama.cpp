@@ -2734,7 +2734,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // the first node plus a hash of the node count and the shapes of the first nodes: a graph whose shape alternates
+    // (e.g. the verify batch of speculative decoding with a variable draft length) keeps one CUDA graph per shape
+    // instead of falling back to eager execution and recapturing on every change. Replays are still guarded by the
+    // full node property check in ggml_cuda_graph_update_required, so a hash collision only costs a recapture.
+    uint64_t h = (uint64_t) (uintptr_t) cgraph->nodes[0];
+    h = (h ^ (uint64_t) cgraph->n_nodes) * 0x100000001B3ull;
+    const int n_hash = std::min(cgraph->n_nodes, 16);
+    for (int i = 0; i < n_hash; ++i) {
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            h = (h ^ (uint64_t) cgraph->nodes[i]->ne[d]) * 0x100000001B3ull;
+        }
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

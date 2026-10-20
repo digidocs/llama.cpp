@@ -39,6 +39,40 @@ Through `llama-server` (ds4f.sh settings, 450K context, 5 chat prompts x 700 tok
 
 zmm is ~4% faster single-threaded, but at 16+ threads the kernel is DRAM bound (~102 GB/s of ~122) and the two are equal within noise. ymm stays the default: no AVX-512 license transitions (relevant when other work shares the cores), and it is the smaller change.
 
+## Q4_K_XL (recommended model)
+
+UD-Q4_K_XL keeps the experts in MXFP4 (lossless for this model, same bytes and kernels as Q8_K_XL). Only the dense weights change: BF16 -> Q8_0 (7.9 GB instead of 14.7 GB). UD-IQ4_XS re-quantizes the gate/up experts to IQ3_S: it decoded *slower* (11.95 t/s at 20 threads; the IQ3_S CPU kernel is compute bound) and was dropped.
+
+llama-bench, ub 4096: pp4096 288 t/s, tg128 17.8 (20 threads) / 18.1 (24 threads), vs Q8_K_XL 284 / 16.1.
+
+Server runs (`spec_run.sh` with `MODEL=` override, `GGML_OP_OFFLOAD_MIN_BATCH=768`, 20 threads everywhere; pp = 9,094-token prompt, tg = 5 chat prompts x 700 tokens). Run-to-run noise on tg is about +-0.4 t/s.
+
+| config | context | VRAM | pp t/s | tg t/s | acceptance |
+|---|---|---|---|---|---|
+| ub 4096 | 450K | 17.2 GB | 210 | 17.13 | - |
+| ub 4096, 24 threads | 450K | 17.2 GB | 211 | 17.15 | - |
+| ub 4096 | 250K | - | - | 16.58 | - |
+| **ub 6144** | 450K | 20.7 GB | **270** | 16.70 | - |
+| ub 8192 | 450K | OOM (13.5 GB compute buffer) | | | |
+| ub 8192 | 250K | 18.6 GB | 285 | 16.51 / 16.63 | - |
+| DSpark n3, ub 4096 | 450K | 18.4 GB | 206 | 18.28 | 65% |
+| DSpark n3, 24 threads | 450K | 18.4 GB | - | 18.25 | 65% |
+| DSpark n2, ub 4096 | 450K | 18.4 GB | - | 18.62 | 75% |
+| DSpark n1, ub 4096 | 450K | 18.4 GB | - | 18.58 | 84% |
+| DSpark n3, ub 8192 | 200K | 18.6 GB | 276 | 17.45 | 65% |
+| DSpark n3, ub 6144 | 450K | 21.9 GB | 261 | 18.47 | 65% |
+| **DSpark n2, ub 6144** | 450K | 21.9 GB | **259** | 17.85 | 75% |
+
+Notes:
+- The 9K pp test is 2 x 4096 + a 902-token tail at ub 4096 (the tail costs about as much as a full chunk); ub 6144 makes it 6144 + 2950, which is why pp jumps from 210 to 270. Long prompts approach the llama-bench numbers (288 at ub 4096, ~413 at ub 8192).
+- ub 8192 at 250K and the 250K ub 4096 control decode at the same speed, so the ubatch size does not cost tg; the lower 250K numbers vs the first 450K runs look like run-to-run drift.
+- DSpark n-max 1/2/3 and ub 4096/6144 all land within the noise band (17.9-18.6). n-max 2 is the middle choice.
+- 24 threads gives no gain over 20 in server runs.
+
+Launch scripts (copies in `scripts/`):
+- `~/ds4f-q4.sh`: Q4_K_XL, 450K context, ub 6144. ~17 t/s, ~270 t/s pp, 20.7 GB.
+- `~/ds4f-q4-dspark.sh`: the same plus DSpark Q8_0 (n-max 2, draft experts on CPU). ~18-18.5 t/s, ~260 t/s pp, 21.9 GB.
+
 ## Where the time goes now (~62 ms/token at 20 threads)
 
 | part | ms/token | notes |

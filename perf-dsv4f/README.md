@@ -4,21 +4,35 @@ Branch: `perf/dsv4-flash-profile` (based on master `ff5a23376`)
 
 Goal: more decode tokens/s for `~/ds4f.sh` (UD-Q8_K_XL, experts MXFP4 on CPU via `-ncmoe 999`, dense BF16/Q8 on the RTX 3090) without losing precision, prompt processing speed, or VRAM (need >= 100K context with MTP).
 
-## Current status (final benchmark, commit 58762b174)
+## Current status
 
-Recommended: **`~/ds4f-q4.sh`** (UD-Q4_K_XL, 450K context, ub 6144, 20 threads, `GGML_OP_OFFLOAD_MIN_BATCH=768`).
+Recommended: **`~/ds4f-q4-dspark.sh`** (UD-Q4_K_XL + DSpark Q8_0 draft with **1 drafted token**, 450K context, ub 6144, 20 threads, `GGML_OP_OFFLOAD_MIN_BATCH=768`). `~/ds4f.sh` points to it; `~/ds4f-q4.sh` is the same without a draft.
 
 | | context | VRAM | pp (9K prompt) | tg |
 |---|---|---|---|---|
 | start: Q8_K_XL, master | 450K | 23.0 GB | 207 t/s | 11.0 (bench) |
-| `ds4f-q4.sh` (server) | 450K | 20.7 GB | **271 t/s** | **18.55 t/s** |
-| `ds4f-q4-dspark.sh` (server, DSpark n-max 2) | 450K | 21.9 GB | 263 t/s | 18.31 t/s (75% acceptance) |
+| `ds4f-q4.sh` (server, no draft) | 450K | 20.7 GB | 271 t/s | 18.19 / 18.55 t/s (two runs) |
+| **`ds4f-q4-dspark.sh`** (server, n-max 1) | 450K | 21.9 GB | **269 t/s** | **19.50 t/s** (84% acceptance) |
 
 llama-bench (Q4_K_XL, 20 threads, `-lm none`): pp4096 290 t/s at ub 4096 and 6144; tg128 18.48 +- 0.51 (ub 4096) / 18.38 +- 0.51 (ub 6144). With `-lm mmap`, tg128 is 18.86 +- 0.03.
 
-DSpark no longer pays off: the bit-exact GPU work sped up plain decode (server 16.7 -> 18.55 t/s at the same settings) more than speculative decoding, whose verify batches are dominated by the CPU expert reads. It is now within noise of no draft, and costs 1.2 GB of VRAM and a little pp.
+Draft settings (server, same harness, after the GPU fusions):
 
-Decode progress, all without precision loss beyond the model quant: 11.04 (master, Q8_K_XL) -> 16.10 (CPU expert fixes) -> 17.8 (Q4_K_XL) -> 18.86 t/s (bit-exact GPU fusions + quantize reuse), llama-bench.
+| draft | n-max | p-min | tg t/s | acceptance |
+|---|---|---|---|---|
+| none (controls) | - | - | 18.19, 18.55 | - |
+| DSpark Q8_0 | **1** | 0 | **19.50** | 84% |
+| DSpark Q8_0 | 2 | 0 | 18.31 | 75% |
+| DSpark Q8_0 | 2 | 0.5 | 18.89 | 77% |
+| DSpark Q8_0 | 3 | 0.7 | 16.51 | 86% |
+| DSpark Q8_0 | 4 | 0.8 | 16.66 | 91% |
+
+- Each drafted token costs a full set of CPU expert reads when it is verified (tokens mostly route to different experts), and a rejected one wastes them; only the GPU part is shared across the verify batch. After the GPU fusions shrank that part, 1 drafted token is the sweet spot.
+- A p-min cutoff raises acceptance but was much slower at n-max 3 and 4, likely because the varying draft length changes the verify batch size every step (graph rebuilds / CUDA graph recapture). Not investigated.
+- The Q2K-Q4K draft runs and the closing no-draft control were stopped before they finished. 19.50 is a single run; the run-to-run noise of tg is about +-0.4 t/s.
+- No MTP head in this GGUF (no `mtp`/`nextn` tensors), so `draft-mtp` is not an option.
+
+Decode progress, all without precision loss beyond the model quant: 11.04 (master, Q8_K_XL) -> 16.10 (CPU expert fixes) -> 17.8 (Q4_K_XL) -> 18.86 t/s (bit-exact GPU fusions + quantize reuse), llama-bench; 19.5 t/s with the server and DSpark n-max 1.
 
 Remaining options, by size: overlap of the shared expert on the GPU with the CPU routed experts (~4.5 ms/token, ~+8%, scheduler work); rms_norm fusions (~0.6 ms total, three separate bit-exact fusions of about 0.4% each); everything else is small.
 

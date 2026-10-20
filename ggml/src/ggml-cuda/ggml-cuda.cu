@@ -4695,8 +4695,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // GGML_CUDA_NO_MMVQ_SRC1_REUSE=1 quantizes src1 for every mul_mat_vec_q call
+            static const bool mmvq_reuse = !ggml_cuda_env_flag("GGML_CUDA_NO_MMVQ_SRC1_REUSE");
+            ggml_cuda_mmvq_src1_cache & mmvq_cache = cuda_ctx->mmvq_src1_cache;
+            mmvq_cache.reset();
+            mmvq_cache.active = mmvq_reuse;
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (!ggml_cuda_is_view_or_noop(node) && mmvq_cache.overlaps(node)) {
+                    mmvq_cache.reset();
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4740,6 +4749,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    // the fused kernel wrote the outputs of the skipped nodes
+                    for (int j = i + 1; j <= i + nodes_to_skip; ++j) {
+                        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && mmvq_cache.overlaps(cgraph->nodes[j])) {
+                            mmvq_cache.reset();
+                        }
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4776,6 +4791,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            mmvq_cache.reset();
+            mmvq_cache.active = false;
         }
 
 #ifdef USE_CUDA_GRAPH

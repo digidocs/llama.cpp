@@ -4586,6 +4586,84 @@ struct test_dsv4_hc : public test_case {
     }
 };
 
+// DeepSeek V4 hyper-connection gate chain: MUL (scalar) -> ADD (row vector) -> SIGMOID -> SCALE, fused in the CUDA backend
+struct test_dsv4_hc_gate : public test_case {
+    const int64_t n_tokens;
+    const float   s;
+    const float   b;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_tokens, s, b);
+    }
+
+    test_dsv4_hc_gate(int64_t n_tokens = 1, float s = 2.0f, float b = 0.0f) : n_tokens(n_tokens), s(s), b(b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(mixes, "mixes");
+        ggml_set_name(scale, "scale");
+        ggml_set_name(base, "base");
+
+        ggml_tensor * x = ggml_view_2d(ctx, mixes, hc, n_tokens, mixes->nb[1], hc*sizeof(float));
+        ggml_tensor * m = ggml_view_1d(ctx, scale, 1, sizeof(float));
+        ggml_tensor * c = ggml_view_1d(ctx, base, hc, hc*sizeof(float));
+
+        ggml_tensor * out = ggml_mul(ctx, x, m);
+        out = ggml_add(ctx, out, c);
+        out = ggml_sigmoid(ctx, out);
+        out = ggml_scale_bias(ctx, out, s, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DSV4_COMP_POOL
+struct test_dsv4_comp_pool : public test_case {
+    const int64_t n_embd;
+    const int64_t n_rows;
+    const int64_t n_blocks;
+    const int32_t ratio;
+    const bool    overlap;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_rows, n_blocks, ratio, overlap);
+    }
+
+    test_dsv4_comp_pool(int64_t n_embd = 512, int64_t n_rows = 16, int64_t n_blocks = 1, int32_t ratio = 4, bool overlap = true)
+        : n_embd(n_embd), n_rows(n_rows), n_blocks(n_blocks), ratio(ratio), overlap(overlap) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t w = overlap ? 2*n_embd : n_embd;
+        ggml_tensor * kv    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w, n_rows);
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w, n_rows);
+        ggml_tensor * idxs  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (overlap ? 2 : 1)*ratio*n_blocks);
+        ggml_set_name(kv, "kv");
+        ggml_set_name(score, "score");
+        ggml_set_name(idxs, "idxs");
+        ggml_tensor * out = ggml_dsv4_comp_pool(ctx, kv, score, idxs, ratio, overlap);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // with overlap, index n_rows selects the implicit kv = 0, score = -inf row
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % (n_rows + (overlap ? 1 : 0));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            }
+        }
+    }
+};
+
 struct test_dsv4_hc_comb : public test_dsv4_hc {
     const int64_t n_tokens;
     const int32_t n_iter;
@@ -10067,6 +10145,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    for (bool overlap : {true, false}) {
+        for (int64_t n_blocks : {1, 3, 37}) {
+            test_cases.emplace_back(new test_dsv4_comp_pool(512, 64, n_blocks, overlap ? 4 : 128, overlap));
+        }
+    }
+    test_cases.emplace_back(new test_dsv4_comp_pool(128, 9, 5, 4, true));
+    for (int64_t n_tokens : {1, 7, 512}) {
+        test_cases.emplace_back(new test_dsv4_hc_gate(n_tokens, 2.0f, 0.0f));
+        test_cases.emplace_back(new test_dsv4_hc_gate(n_tokens, 1.0f, 1e-6f));
+    }
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));

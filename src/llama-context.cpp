@@ -159,6 +159,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_comp_pool_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_COMP_POOL,
+    /*.name             =*/ "fused DeepSeek V4 compressor pooling",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
     /*.name             =*/ "fused DeepSeek V4 HC post",
@@ -337,6 +343,11 @@ llama_context::llama_context(
     // only the indexer models build this mask, skip the probe for the others
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
+    // LLAMA_DSV4_COMP_POOL=0 keeps the decomposed compressor pooling (for comparisons)
+    {
+        const char * env = getenv("LLAMA_DSV4_COMP_POOL");
+        cparams.fused_dsv4_comp_pool = !env || atoi(env) != 0;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -679,6 +690,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        resolve(llm_fused_op_dsv4_comp_pool_probe, cparams.fused_dsv4_comp_pool);
         cparams.auto_fhc = false;
     }
 

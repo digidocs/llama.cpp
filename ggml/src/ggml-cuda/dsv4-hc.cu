@@ -331,3 +331,41 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
             gate_in, gate_out);
 }
+
+// each step rounds like its own kernel: op_mul and op_add as separate roundings (no contraction), op_sigmoid,
+// and scale_f32, which compiles to one FFMA (scale*x + bias)
+static __global__ void dsv4_hc_gate_f32(
+        const float * __restrict__ x, const float * __restrict__ m, const float * __restrict__ c, float * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t sx1, const float scale, const float bias) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= ne0*ne1) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = i / ne0;
+
+    const float t = __fadd_rn(__fmul_rn(x[i0 + i1*sx1], m[0]), c[i0]);
+    const float y = 1.0f / (1.0f + expf(-t));
+    dst[i] = __fmaf_rn(scale, y, bias);
+}
+
+void ggml_cuda_op_dsv4_hc_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, const ggml_tensor * add, ggml_tensor * scale) {
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * m = mul->src[1];
+    const ggml_tensor * c = add->src[1];
+
+    const float s = ggml_get_op_params_f32(scale, 0);
+    const float b = ggml_get_op_params_f32(scale, 1);
+
+    const int64_t ne0 = x->ne[0];
+    const int64_t ne1 = x->ne[1];
+    const int64_t n   = ne0*ne1;
+    if (n == 0) {
+        return;
+    }
+
+    const int block_size = 256;
+    dsv4_hc_gate_f32<<<(n + block_size - 1)/block_size, block_size, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) m->data, (const float *) c->data, (float *) scale->data,
+            ne0, ne1, x->nb[1]/sizeof(float), s, b);
+}

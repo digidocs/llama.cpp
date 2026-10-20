@@ -1442,6 +1442,51 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// the q8_1 quantization of src1 of the last ggml_cuda_mul_mat_vec_q call, reused by later calls on the same src1 tensor
+// (e.g. the projections that all read one normed hidden state); only valid during one graph evaluation, which invalidates
+// it whenever a node writes memory overlapping src1
+struct ggml_cuda_mmvq_src1_cache {
+    bool                active = false;
+    const ggml_tensor * src1   = nullptr;
+    const void        * data   = nullptr;
+    int64_t             ne[GGML_MAX_DIMS] = {};
+    size_t              nb[GGML_MAX_DIMS] = {};
+    int64_t             ne10_padded = 0;
+    cudaStream_t        stream = nullptr;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_1;
+
+    // must only be called while q8_1 is the most recent pool allocation (the pool frees in reverse order)
+    void reset() {
+        q8_1.reset();
+        src1 = nullptr;
+        data = nullptr;
+    }
+
+    bool matches(const ggml_tensor * t, int64_t ne10_pad, cudaStream_t s) const {
+        if (!active || src1 != t || data != t->data || ne10_padded != ne10_pad || stream != s) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (ne[i] != t->ne[i] || nb[i] != t->nb[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // true if t's memory overlaps the bytes of src1 the cached quantization was made from
+    bool overlaps(const ggml_tensor * t) const {
+        if (src1 == nullptr || t->data == nullptr) {
+            return false;
+        }
+        const char * a0 = (const char *) data;
+        const char * a1 = a0 + ggml_nbytes(src1);
+        const char * b0 = (const char *) t->data;
+        const char * b1 = b0 + ggml_nbytes(t);
+        return b0 < a1 && a0 < b1;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1560,6 +1605,8 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    ggml_cuda_mmvq_src1_cache mmvq_src1_cache;
 };
 
 struct ggml_cuda_mm_fusion_args_host {

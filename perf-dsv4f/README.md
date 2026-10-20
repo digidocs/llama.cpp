@@ -73,6 +73,34 @@ Launch scripts (copies in `scripts/`):
 - `~/ds4f-q4.sh`: Q4_K_XL, 450K context, ub 6144. ~17 t/s, ~270 t/s pp, 20.7 GB.
 - `~/ds4f-q4-dspark.sh`: the same plus DSpark Q8_0 (n-max 2, draft experts on CPU). ~18-18.5 t/s, ~260 t/s pp, 21.9 GB.
 
+## Bit-exact GPU fusions
+
+Rule: a fusion must give **bitwise identical** results to the unfused CUDA kernels, not just "close". Reason: this model amplifies float differences (MoE routing flips), so an end-to-end check cannot tell a bug from legitimate reordering:
+
+| vs reference logits (`kld_check.sh`, 2 x 512 tokens) | mean KLD | max KLD | same top-1 |
+|---|---|---|---|
+| identical rerun | 0.000000 | 0.000039 | 100% |
+| `GGML_CUDA_DISABLE_FUSION=1` (upstream fusions reorder fp) | 0.0039 | 0.11 | 98.8% |
+
+The nonzero floor of an identical rerun comes from the 16-bit logit storage of `--kl-divergence-base`. Each fusion is verified three ways:
+1. `perf-dsv4f/bitexact/*`: fused vs unfused CUDA outputs compared with memcmp/cmp, random data incl. -0, denormals and saturation, plus a negative control that must fail (the CPU implementation for comp_pool; a deliberately FMA-contracted kernel for the HC gate), and an nsys check that the fused kernel actually ran
+2. `test-backend-ops` (CUDA vs CPU reference within tolerance)
+3. `kld_check.sh` on the decode path (UB=1) and the prefill path (UB=512): must equal the identical-rerun floor exactly
+
+Iteration: `LOAD_MODE=mmap` keeps the model in the page cache, ~74 s per model-level check (vs ~3.8 min with `-lm none`).
+
+| fusion | kernels/token | Q4_K_XL tg128 |
+|---|---|---|
+| baseline | 4398 | 18.03 |
+| `DSV4_COMP_POOL` op (compressor gather/softmax/weighted sum; `LLAMA_DSV4_COMP_POOL=0` disables) | | 18.61 |
+| CUDA fusion MUL -> ADD -> SIGMOID -> SCALE (hyper-connection gates) | 3258 | **18.78** |
+
+GPU busy per token 18.25 -> 15.43 ms. How exactness was achieved:
+- comp_pool: one warp per output replays soft_max_f32 and reduce_rows_f32 exactly: same block sizes (32/128 for the softmax, 32 or 512 for sum_rows depending on rows vs SM count), same per-thread partial sums and butterfly / inter-warp trees, `vals*(1/sum)` form, and the appended zero/-inf rows computed as `0*x` like the scale kernel. A first version that emulated this with one thread per output was exact but slower than the unfused chain (17.80 vs 17.96).
+- hc_gate: `__fmul_rn`/`__fadd_rn` to stop contraction, the same sigmoid expression, and `__fmaf_rn` because `scale_f32` compiles to FFMA.FTZ (checked in the SASS). The first matcher never fired because a view node sits between MUL and ADD in the node list; the nsys kernel check caught that (the "identical" result was vacuous).
+
+Next candidates: shared quantize_q8_1 for consecutive mat-vec ops on the same src1 (511/token, 0.70 ms), rms_norm (365/token, 0.91 ms), concat/get_rows/set_rows/rope (~780/token, ~1.3 ms).
+
 ## Where the time goes now (~62 ms/token at 20 threads)
 
 | part | ms/token | notes |

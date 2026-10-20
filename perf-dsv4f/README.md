@@ -93,13 +93,16 @@ Iteration: `LOAD_MODE=mmap` keeps the model in the page cache, ~74 s per model-l
 |---|---|---|
 | baseline | 4398 | 18.03 |
 | `DSV4_COMP_POOL` op (compressor gather/softmax/weighted sum; `LLAMA_DSV4_COMP_POOL=0` disables) | | 18.61 |
-| CUDA fusion MUL -> ADD -> SIGMOID -> SCALE (hyper-connection gates) | 3258 | **18.78** |
+| CUDA fusion MUL -> ADD -> SIGMOID -> SCALE (hyper-connection gates) | 3258 | 18.78 |
+| reuse of the q8_1 quantization of src1 across mul_mat_vec_q calls (`GGML_CUDA_NO_MMVQ_SRC1_REUSE=1` disables) | 3091 | **18.86** |
 
-GPU busy per token 18.25 -> 15.43 ms. How exactness was achieved:
+GPU busy per token 18.25 -> 15.10 ms. How exactness was achieved:
 - comp_pool: one warp per output replays soft_max_f32 and reduce_rows_f32 exactly: same block sizes (32/128 for the softmax, 32 or 512 for sum_rows depending on rows vs SM count), same per-thread partial sums and butterfly / inter-warp trees, `vals*(1/sum)` form, and the appended zero/-inf rows computed as `0*x` like the scale kernel. A first version that emulated this with one thread per output was exact but slower than the unfused chain (17.80 vs 17.96).
 - hc_gate: `__fmul_rn`/`__fadd_rn` to stop contraction, the same sigmoid expression, and `__fmaf_rn` because `scale_f32` compiles to FFMA.FTZ (checked in the SASS). The first matcher never fired because a view node sits between MUL and ADD in the node list; the nsys kernel check caught that (the "identical" result was vacuous).
 
-Next candidates: shared quantize_q8_1 for consecutive mat-vec ops on the same src1 (511/token, 0.70 ms), rms_norm (365/token, 0.91 ms), concat/get_rows/set_rows/rope (~780/token, ~1.3 ms).
+- mmvq src1 reuse: quantize_q8_1 per token 511 -> 344. The cache holds one src1 per graph evaluation, keyed by tensor, data pointer, shape/strides, padding and stream; any node writing memory overlapping src1 invalidates it. Bitwise identical by construction (same quantization); the harness rewrites src1 in place between the calls, and a build with invalidation disabled is detected. A multi-entry cache would only remove 85 more per token (~0.12 ms), not worth it.
+
+Next candidates: rms_norm (365/token, 0.91 ms), concat/get_rows/set_rows/rope (~780/token, ~1.3 ms).
 
 ## Where the time goes now (~62 ms/token at 20 threads)
 

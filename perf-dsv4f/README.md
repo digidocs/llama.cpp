@@ -42,6 +42,27 @@ Draft settings (server, Q4_K_XL, 450K, ub 6144), before and after the fix:
 - The Q8_K_XL DSpark script still uses n-max 1 (17.81 t/s at 200K, 17.97 at 350K); the cutoff settings were not re-tested on Q8_K_XL.
 - No MTP head in this GGUF (no `mtp`/`nextn` tensors), so `draft-mtp` is not an option. The Q2K-Q4K draft was not tested.
 
+### Speculative step cost breakdown
+
+Cost model fitted over the 30 prompt x config points of the second draft matrix: ms/step ~= 37.9 + 31.4 * verified tokens (rms error 7.5 ms). The marginal cost of a verified token (~31 ms) is the CPU expert read; tokens route to different experts, so the batch barely shares it. Break-even: an extra drafted token pays off only if its chance of acceptance is above ~57%.
+
+Target alone (`llama-batched-bench`, B sequences decoding one token each, Q4_K_XL): 54.1 / 84.4 / 114.3 / 142.8 ms per step for B = 1-4 (+30, +30, +28.5 ms per extra token).
+
+Measured per step with temporary server timers (one 1,200-token code prompt):
+
+| ms per step | no draft | DSpark n-max 1 | DSpark n-max 3, p-min 0.7 |
+|---|---|---|---|
+| target decode + sync | 54.5 | 87.5 (2 tokens) | 139.3 (3.54 tokens avg) |
+| plain batch of that size | 54.1 | 84.4 | ~129.7 |
+| extra verify cost | - | 3.1 | 9.6 |
+| draft generation | - | 5.1 | 9.6 |
+| bookkeeping (sampling, draft ctx) | 0.35 | 1.9 | 2.4 |
+| ms per output token | 54.3 | 48.0 (20.8 t/s) | 44.0 (22.7 t/s) |
+
+- DSpark drafts a batch of n-max positions in one decode; its experts are on the CPU, so drafting costs ~2.4 ms fixed + ~2.4 ms per position (3 layers x 6 experts, ~240 MB per position).
+- Speculative checkpoints cost ~0.3 ms (DSpark sets the target's n_rs_seq to n-max, so rollback happens in place without the checkpoint/replay path).
+- The larger extra verify cost with a variable draft length is mostly remaining CUDA graph recaptures (~2.6 per step). A `GGML_CUDA_GRAPH_WHY` debug run (temporary, removed) showed two causes: `ffn_moe_weighted` changing data pointer between calls of the same shape (llama keeps one previous graph, so it rebuilds and reallocates on each batch size change), and new graph variants as context-dependent views grow. Estimated ~4-5 ms/step, ~3%. Fixing it needs llama to keep one graph per verify batch size with stable allocations (llama-context graph reuse change), not attempted.
+
 ### Host memory notes
 THP is `enabled=always` on this machine; khugepaged and kcompactd0 show bursts of CPU during model load (141 GB pinned allocation while the model file is in the page cache) and are idle during decode. The pinned CUDA host buffer gains nothing from THP. Optional, non-persistent: `echo madvise > /sys/kernel/mm/transparent_hugepage/enabled`, `echo 0 > .../khugepaged/defrag`, `echo 0 > /proc/sys/vm/compaction_proactiveness` (not applied or measured).
 

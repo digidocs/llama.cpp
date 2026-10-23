@@ -1256,8 +1256,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+
+                        // an extra buffer type of a GPU (e.g. alternative weight storage) only supports some uses of a
+                        // weight: keep the default buffer type for the others
+                        auto * buft_dev = ggml_backend_buft_get_device(buft);
+                        if (buft_dev && ggml_backend_dev_type(buft_dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                                buft != ggml_backend_dev_buffer_type(buft_dev) && buft != ggml_backend_dev_host_buffer_type(buft_dev) &&
+                                !weight_buft_supported(hparams, t_meta, op, buft, buft_dev)) {
+                            LLAMA_LOG_WARN("%s: tensor %s cannot use buffer type %s, keeping the default\n", __func__,
+                                tensor_name.c_str(), ggml_backend_buft_name(buft));
+                            buft = nullptr;
+                        }
                     }
 
+                    if (!buft) {
+                        break;
+                    }
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
                             tensor_name.c_str(),
                             ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),

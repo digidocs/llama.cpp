@@ -2386,6 +2386,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
 
+    // the per-expert mul_mat calls below run while this function holds pool allocations, so a cached src1
+    // quantization made by them would be freed out of order: release it now and keep it off until we return
+    struct mmvq_cache_off {
+        ggml_cuda_mmvq_src1_cache & c;
+        const bool active;
+        explicit mmvq_cache_off(ggml_cuda_mmvq_src1_cache & c) : c(c), active(c.active) { c.reset(); c.active = false; }
+        ~mmvq_cache_off() { c.active = active; }
+    } mmvq_cache_guard(ctx.mmvq_src1_cache);
+
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
 

@@ -25,6 +25,8 @@ Same `llama-bench` command as the start of the project (`-p 4096 -n 128 -b 4096 
 | now, BF16 dense | 16 / 20 | 284.66 / 284.80 | 16.73 / 17.56 |
 | **now, FP8 dense** | 16 / 20 | 283.40 / 283.79 | **17.82 / 18.69** (1.69x the start at 20 threads) |
 
+DSpark settings re-swept after the FP8 change (Q8_K_XL FP8 dense, 450K, 5 prompts x 700 tokens; t/s, acceptance, hard prose prompt p3): n1 19.56 / 82.5% / 17.45; n2 19.78 / 73.5% / 15.78; n2 p0.5 19.90 / 79.3% / 16.35; **n3 p0.7 20.16 / 86.2% / 17.04** (kept); n3 p0.6 20.07 / 80.9% / 16.69; n4 p0.8 19.67 / 90.9% / 15.92.
+
 Threads with FP8 dense (tg128, 5 runs): 20 = 18.72 +- 0.17, 22 = 18.73, 24 = 18.82; within noise, so the scripts stay at 20 threads (decode is DRAM bound, and the 4 free cores serve the OS, HTTP and the CUDA driver thread).
 
 ### CUDA graph re-recording, CPU/GPU overlap, faster loading

@@ -86,7 +86,7 @@ MXFP8 stores exactly that: 32 e4m3 bytes plus one E8M0 (power-of-two) scale byte
 
 ## Scan results (`perf-dsv4f/fp8scan.py`, all BF16 tensors of UD-Q8_K_XL)
 
-Each tensor kind is all-or-nothing: every block passes, or every block fails. Confirmed on all 43 layers (summary in `~/dsv4f-work/fp8scan.txt`).
+Each tensor kind is all-or-nothing: every block passes, or every block fails. Confirmed on all 43 layers (`perf-dsv4f/fp8scan.py` reproduces the scan in a few minutes).
 
 | tensor kind | exact | size (43 layers unless noted) |
 |---|---|---|
@@ -159,7 +159,7 @@ Quick checks:
 - `TAG=x perf-dsv4f/md5_q8.sh`: Q8 no draft, 300 tokens, md5 **`1129672c4d2a`**
 - `TAG=x perf-dsv4f/md5_q4_dspark.sh`: Q4 + DSpark, 600 tokens, md5 **`349af7bedf9c`**, draft 449/422
 
-Full runs: `OUT=~/dsv4f-work SKIP_PP=1 GGML_OP_OFFLOAD_MIN_BATCH=768 perf-dsv4f/spec_run.sh <tag> <args>`, 5 prompts x 700 tokens. Drop `SKIP_PP` to also measure pp.
+Full runs: `perf-dsv4f/verify_q8.sh` (Q8 FP8, no draft with pp, then DSpark at 450K), or `OUT=~/dsv4f-work SKIP_PP=1 GGML_OP_OFFLOAD_MIN_BATCH=768 perf-dsv4f/spec_run.sh <tag> <args>`, 5 prompts x 700 tokens. Drop `SKIP_PP` to also measure pp.
 
 | config | args | md5s (p0..p4) | t/s |
 |---|---|---|---|
@@ -174,7 +174,7 @@ Q4_K_XL quantizes these dense tensors itself (lossy), so FP8 storage only applie
 
 | # | step | status |
 |---|---|---|
-| 0 | Finish the scan, confirm the table | running (`~/dsv4f-work/fp8scan.txt`) |
+| 0 | Finish the scan, confirm the table | done: all 43 layers confirmed |
 | 1 | Read the current BF16 paths (section 3), write findings here | done, see section 4 |
 | 2 | `CUDA0_FP8` buffer type: alloc size, exact `set_tensor`, `get_tensor`, op refusal, `-ot` registration (`common/arg.cpp`), support check for overrides in the loader | done |
 | 3 | Safety net: MXFP8 -> BF16 expansion feeding the existing paths (all of mmvf, mmf and cuBLAS at first) | done: Q8 md5 `1129672c4d2a` identical, weights 13,004 -> 7,592 MiB, 6.3 GB free at 450K, 12.0 t/s (expansion on every call) |

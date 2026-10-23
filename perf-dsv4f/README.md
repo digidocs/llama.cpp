@@ -6,14 +6,24 @@ Goal: more decode tokens/s for `~/ds4f.sh` (UD-Q8_K_XL, experts MXFP4 on CPU via
 
 ## Current status
 
-Launch scripts (copies in `scripts/`), all 20 threads on cores 0-19, `GGML_OP_OFFLOAD_MIN_BATCH=768`:
+Launch scripts (copies in `scripts/`), all 20 threads on cores 0-19, `GGML_OP_OFFLOAD_MIN_BATCH=768`, `-lm dio`:
 
 | script | model | context | ubatch | draft | server tg | pp (9K prompt) | VRAM |
 |---|---|---|---|---|---|---|---|
-| `~/ds4f.sh` | Q8_K_XL | 450K | 4096 | none | 15.8 t/s | 208 t/s | 23.0 GB |
-| `~/ds4f-dspark.sh` | Q8_K_XL | 350K | 4096 | DSpark Q8_0, n-max 3, p-min 0.7 | 18.33 t/s (18.04 with thinking) | 205 t/s | 22.5 GB |
+| `~/ds4f.sh` | Q8_K_XL | 450K | 4096 | none | **17.27 t/s** (was 16.1) | 208.8 t/s | 23.0 GB |
+| `~/ds4f-dspark.sh` | Q8_K_XL | 350K | 4096 | DSpark Q8_0, n-max 3, p-min 0.7 | **19.65 t/s** (same-build old path 18.94) | 205 t/s | 22.5 GB |
 | `~/ds4f-q4.sh` | Q4_K_XL | 450K | 6144 | none | 18.0-18.55 t/s | 271 t/s | 20.7 GB |
-| **`~/ds4f-q4-dspark.sh`** | Q4_K_XL | 450K | 6144 | DSpark Q8_0, **n-max 3, p-min 0.7** | **19.86 t/s** | 267 t/s | 21.9 GB |
+| **`~/ds4f-q4-dspark.sh`** | Q4_K_XL | 450K | 6144 | DSpark Q8_0, **n-max 3, p-min 0.7** | **19.86 t/s** (before the changes below) | 267 t/s | 21.9 GB |
+
+The Q4_K_XL rows have not been re-measured after the CUDA graph, overlap and loader changes below (one 600-token Q4 + DSpark request: 23.63 t/s, byte-identical output). Model load (Q8_K_XL) is ~76 s to ready, was ~162 s.
+
+### CUDA graph re-recording, CPU/GPU overlap, faster loading
+
+All three are exact: every output was checked byte-identical (md5 of the reply text) against the previous code path. Q8_K_XL no draft, 5 prompts x 700 tokens: all 5 md5s equal to two earlier baselines. Q8_K_XL + DSpark: all 5 md5s equal to the old path in the same build, same draft counts (1860/2157). Q4_K_XL + DSpark 600-token request: md5 equal to the run before these changes.
+
+1. **CUDA graph keying** (`ggml-cuda.cu`, `ggml_cuda_graph_get_key` and the post-warmup branch of `ggml_backend_cuda_graph_compute`). The key hashes only the first node's shape, so each batch size keeps one graph while context-dependent shapes (e.g. the `csa_raw_k`/`hca_raw_k` windows) update it in place with `cudaGraphExecUpdate`. A graph whose properties change after warmup is captured again right away instead of running eagerly first. On one 600-token Q4 + DSpark request: kernel launch API time 294 -> 147 ms. Q4 + DSpark 19.33 -> 20.19 t/s (single runs).
+2. **Shared expert overlapped with the CPU experts.** `deepseek4.cpp` puts the shared expert into the graph between the expert selection and the routed experts (via `llm_graph_context::moe_pre_experts`). The scheduler (`ggml-backend.cpp`, `ggml_backend_sched_early_copy_nodes`) splits a GPU split whose next split runs on the CPU: it computes the nodes the CPU split needs, copies the CPU inputs with `tensor_get_async` plus an event, then queues the rest (the shared expert) and starts the CPU split. Chains that read early nodes (and views of copied inputs) stay in the early part so fused kernels are not cut; a first version cut between ARGSORT and its top-k VIEW, which disabled the fused top-k MoE kernel and changed the output. `GGML_SCHED_NO_EARLY_COPY=1` turns it off. Q8_K_XL no draft 16.06-16.13 -> 17.27 t/s (+7.2%, ~4.2 ms/token: ~2.8 ms shared expert, ~1.4 ms from replacing a full GPU synchronize + blocking read per layer with one event wait). Q8_K_XL + DSpark 18.94 -> 19.65 t/s in the same build.
+3. **Loading.** `-lm dio` (O_DIRECT, already in llama.cpp) reads 151 GB at 2.0 GB/s instead of 1.3. The loader now reads host-buffer tensors with 8 threads (`LLAMA_LOAD_THREADS`), each with its own file handles, while the main thread stages the GPU tensors: 3.1 GB/s, close to the SN730's rating. Large CUDA host buffers are allocated with `mmap` + `MADV_HUGEPAGE`, faulted in by up to 32 threads, then `cudaHostRegister`ed (`GGML_CUDA_NO_HOST_REGISTER=1` restores `cudaMallocHost`): pinning 141 GB 39 s -> 22 s, most of what is left is the single-threaded `cudaHostRegister` call. pp unchanged (208.8 vs 208 t/s). Q8_K_XL load to ready: ~162 s -> ~76 s.
 
 Start of the project: Q8_K_XL on master, 11.0 t/s (llama-bench), pp 207 t/s on the 9K prompt.
 
@@ -23,7 +33,7 @@ llama-bench (Q4_K_XL, 20 threads, `-lm none`): pp4096 290 t/s at ub 4096 and 614
 
 With a p-min cutoff the draft length varies, so the verify batch alternates between 2-4 tokens. The CUDA backend cached one CUDA graph per ggml graph (keyed by its first node): every shape change reset the warmup, ran the graph eagerly node by node, and recaptured. On one 600-token request (n-max 3, p-min 0.7) there were 1,717 `cudaGraphInstantiate` calls and 2,530 stream captures, vs 59 and 143 with a fixed draft length. Found with nsys after ruling out llama graph rebuilds (realloc counters equal) and noticing 10x more CPU time in ggml-cuda's per-node code.
 
-Fix (commit 0ba9fd8b1): the CUDA graph key also hashes the node count and the shapes of the first 16 nodes, so each batch shape keeps its own captured graph. Replays are still guarded by the full node property check, so a hash collision only costs a recapture. Same request: 13.89 -> 17.49 t/s, captures 2530 -> 586, instantiations 1717 -> 223; fixed-length drafting unchanged. Hashing all nodes instead gave the same speed with more instantiations. The remaining captures come from shapes that really change (e.g. the KV window), as with a fixed draft length.
+Fix (commit 0ba9fd8b1): the CUDA graph key also hashes the node count and the shapes of the first 16 nodes, so each batch shape keeps its own captured graph. Replays are still guarded by the full node property check, so a hash collision only costs a recapture. Same request: 13.89 -> 17.49 t/s, captures 2530 -> 586, instantiations 1717 -> 223; fixed-length drafting unchanged. Hashing all nodes instead gave the same speed with more instantiations. The remaining captures come from shapes that really change (e.g. the KV window), as with a fixed draft length. Superseded: the key now hashes only the first node's shape, and context-dependent shape changes update the graph in place (see "CUDA graph re-recording, CPU/GPU overlap, faster loading").
 
 Draft settings (server, Q4_K_XL, 450K, ub 6144), before and after the fix:
 
@@ -78,7 +88,7 @@ Measured per step with temporary server timers (one 1,200-token code prompt):
 
 - DSpark drafts a batch of n-max positions in one decode; its experts are on the CPU, so drafting costs ~2.4 ms fixed + ~2.4 ms per position (3 layers x 6 experts, ~240 MB per position).
 - Speculative checkpoints cost ~0.3 ms (DSpark sets the target's n_rs_seq to n-max, so rollback happens in place without the checkpoint/replay path).
-- The larger extra verify cost with a variable draft length is mostly remaining CUDA graph recaptures (~2.6 per step). A `GGML_CUDA_GRAPH_WHY` debug run (temporary, removed) showed two causes: `ffn_moe_weighted` changing data pointer between calls of the same shape (llama keeps one previous graph, so it rebuilds and reallocates on each batch size change), and new graph variants as context-dependent views grow. Estimated ~4-5 ms/step, ~3%. Fixing it needs llama to keep one graph per verify batch size with stable allocations (llama-context graph reuse change), not attempted.
+- The larger extra verify cost with a variable draft length is mostly remaining CUDA graph recaptures (~2.6 per step). A `GGML_CUDA_GRAPH_WHY` debug run (temporary, removed) showed two causes: `ffn_moe_weighted` changing data pointer between calls of the same shape (llama keeps one previous graph, so it rebuilds and reallocates on each batch size change), and new graph variants as context-dependent views grow. Estimated ~4-5 ms/step, ~3%. Fixing it needs llama to keep one graph per verify batch size with stable allocations (llama-context graph reuse change), not attempted. Correction: a later debug run that compared every node showed these were real shape changes (the `csa_raw_k`/`hca_raw_k` windows grow with the context, and `ffn_moe_weighted` moves with them), plus first use of each batch size. It was fixed in the CUDA backend instead, see the section at the top.
 
 ### Host memory notes
 THP is `enabled=always` on this machine; khugepaged and kcompactd0 show bursts of CPU during model load (141 GB pinned allocation while the model file is in the page cache) and are idle during decode. The pinned CUDA host buffer gains nothing from THP. Optional, non-persistent: `echo madvise > /sys/kernel/mm/transparent_hugepage/enabled`, `echo 0 > .../khugepaged/defrag`, `echo 0 > /proc/sys/vm/compaction_proactiveness` (not applied or measured).
@@ -188,6 +198,7 @@ GPU busy per token 18.25 -> 15.10 ms. How exactness was achieved:
 Next candidates: rms_norm (365/token, 0.91 ms), concat/get_rows/set_rows/rope (~780/token, ~1.3 ms).
 
 ## Where the time goes now (~62 ms/token at 20 threads)
+Measured before the CPU/GPU overlap: the shared expert now runs during the CPU experts and the per-layer GPU synchronize is gone, ~4.2 ms/token less on Q8_K_XL (~57.9 ms/token).
 
 | part | ms/token | notes |
 |---|---|---|
@@ -212,6 +223,7 @@ GPU kernel split per token (nsys, node-level graph trace): `mul_mat_vec_f` BF16 
 Why the experts don't use the CPU repack path: with `-ncmoe` the experts live in a `CUDA_Host` pinned buffer so the GPU can stream them during prompt processing (pp is PCIe bound: ~150 GB of experts per 4096-token ubatch). Repacked weights can't be offloaded, so repack would kill pp. Decode therefore runs the generic `ggml_vec_dot_mxfp4_q8_0`. `--no-host 1` (THP) gave tg 11.45 but pp dropped to 225, so it's not worth it.
 
 ## Changes on this branch
+The most recent changes (CUDA graph keying, shared-expert overlap, parallel loading and pinning) are described under "Current status" at the top.
 
 0. **The big one, `ggml_compute_forward_mul_mat_id` in `ggml/src/ggml-cpu/ggml-cpu.c`: private src1 for small batches.**
    Before, src1 was quantized to q8_0 once into the shared work buffer (each thread did a slice) and all threads then re-read that shared copy for every weight row. Under heavy weight streaming those shared lines kept getting evicted (my working theory is the Skylake-SP snoop filter back-invalidating them; not verified), and the expert matmul ran ~1.5x slower than the identical loop with thread-local data (66 vs 104 GB/s). The slowdown grew with thread count (none at 1 thread, 445 vs 285 us at 16).
@@ -242,7 +254,7 @@ Verified: all 162 MXFP4 `MUL_MAT` / `MUL_MAT_ID` cases pass vs the CPU reference
   # mode: 0 full layer, 1 gate only (ggml), 2 down only, 3 gate only direct vec_dot loop (no ggml),
   #       4 direct loop with ggml-style 16-row blocking, 5 alternate ggml/direct each iteration
   ```
-- `spec_run.sh` + `spec_prompts.py` + `spec_pp.py`: server A/B for speculative decoding. `spec_pp.py` first runs a ~9K-token prompt twice (prompt cache off) to measure pp; set `PP_ONLY=1` to skip the decode prompts. Starts `llama-server` with the ds4f.sh settings plus whatever args you pass, records VRAM, runs 5 chat prompts x 700 tokens (temp 1.0, fixed seeds, thinking off), prints t/s and draft acceptance, then stops the server with SIGINT so it prints its memory summary. `THINK=1` turns thinking on, `MAX_TOKENS=` changes the per-prompt budget, `SKIP_PP=1` skips the pp measurement.
+- `spec_run.sh` + `spec_prompts.py` + `spec_pp.py`: server A/B for speculative decoding. `spec_pp.py` first runs a ~9K-token prompt twice (prompt cache off) to measure pp; set `PP_ONLY=1` to skip the decode prompts. Starts `llama-server` with the ds4f.sh settings plus whatever args you pass, records VRAM, runs 5 chat prompts x 700 tokens (temp 1.0, fixed seeds, thinking off), prints t/s, draft acceptance and an md5 of each reply (for byte-identical checks), then stops the server with SIGINT so it prints its memory summary. `THINK=1` turns thinking on, `MAX_TOKENS=` changes the per-prompt budget, `SKIP_PP=1` skips the pp measurement.
   ```
   OUT=/tmp/spec perf-dsv4f/spec_run.sh base -c 450000 -lv 4
   OUT=/tmp/spec perf-dsv4f/spec_run.sh ds3 -c 200000 -lv 4 -md models/unsloth/DeepSeek-V4-Flash-0731-GGUF/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
@@ -269,7 +281,7 @@ Status of each option, with what's been measured:
 | short-prompt pp (batched MXFP4 kernel + offload threshold) | - | 2x CPU pp for 32-1000 token prompts | **done**, see "Short prompts" |
 | fuse up + gate + swiglu on CPU | medium | ~1 ms (~2%) | measured, not built |
 | GPU small-kernel fusion | high | up to ~6 ms | not started |
-| overlap shared expert with CPU experts | high | ~4.5 ms | not started |
+| overlap shared expert with CPU experts | high | ~4.5 ms | **done**, +7.2% on Q8_K_XL |
 | fewer CPU-GPU handoffs | medium | 1-3 ms | not started |
 | non-OpenMP build retest | very low | 0-5% | not retested since the private-src1 fix |
 
@@ -363,7 +375,8 @@ The matmul loops already run at ~114 GB/s of ~122, and re-sweeping prefetch afte
 - `mul_mat_vec_f` BF16 (15.3 ms/token): per-weight bandwidth not measured yet. Do that first (~30 min) to see if it has headroom like `wo_a` or not.
 - ~3900 kernels/token, mostly 1-3 us ops (rms_norm, bin_bcast, concat, get_rows, scale, rope, `dsv4_hc_*`): ~6 ms total, the main fusion target. Constraint: no extra VRAM, no lower precision for the dense weights.
 
-### 5. Overlap GPU and CPU work (~4.5 ms/token)
+### 5. (done) Overlap GPU and CPU work (~4.5 ms/token)
+Done, see "CUDA graph re-recording, CPU/GPU overlap, faster loading" at the top. The plan below was the starting point.
 The shared expert (3 x 4096x2048 BF16 per layer, ~2.2 GB/token) could run on the GPU while the CPU does the routed experts. This needs either graph reordering in `src/models/deepseek4.cpp` plus a scheduler change (record the event for the CPU split's inputs before the shared-expert part of the GPU split), or an async CPU split. Only the shared expert can overlap; everything else in a layer depends on the previous step.
 
 ### 6. Spin-wait while the GPU runs
@@ -376,5 +389,5 @@ The shared expert (3 x 4096x2048 BF16 per layer, ~2.2 GB/token) could run on the
 - Lower precision for dense weights: against the precision requirement.
 
 ## Housekeeping
-- `build-noomp/`, `build-swap/` (non-OpenMP libggml-cpu), `build-zmm/` and `build-swap-zmm/` (zmm libggml-cpu, used via `LD_LIBRARY_PATH=$PWD/build-swap-zmm`) are scratch; delete when done. Non-OpenMP has not been retested since the private-src1 fix.
+- `build-swap/` (non-OpenMP libggml-cpu, stale) is scratch; the other scratch builds were deleted. Non-OpenMP has not been retested since the private-src1 fix.
 - The `-lm none` load takes ~150 s; use `moe_real` and `test-backend-ops perf` for iteration and the full `llama-bench` only to confirm.

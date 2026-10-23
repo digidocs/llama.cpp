@@ -1270,9 +1270,18 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        if (instance_tail != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance_tail));
+        }
+        if (graph_tail != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph_tail));
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // a long graph is captured as a short head and a tail: the GPU starts on the head while the tail is launched
+    cudaGraph_t graph_tail = nullptr;
+    cudaGraphExec_t instance_tail = nullptr;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;

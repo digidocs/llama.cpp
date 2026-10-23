@@ -3103,8 +3103,23 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
+static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGraph_t graph);
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    ggml_cuda_graph_update_executable(graph->instance, graph->graph);
+    if (graph->graph_tail != nullptr) {
+        if (graph->instance_tail == nullptr) {
+            CUDA_CHECK(cudaGraphInstantiate(&graph->instance_tail, graph->graph_tail, NULL, NULL, 0));
+        } else {
+            ggml_cuda_graph_update_executable(graph->instance_tail, graph->graph_tail);
+        }
+    }
+}
+
+static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGraph_t graph_in) {
+    struct { cudaGraph_t graph; cudaGraphExec_t instance; } g = { graph_in, instance };
+    auto * graph = &g;
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -3129,6 +3144,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+    instance = graph->instance;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4940,6 +4956,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    // a captured graph with many nodes is split into a head and a tail at an op boundary (see ggml_cuda_graph)
+    [[maybe_unused]] bool graph_split_done = false;
+#ifdef USE_CUDA_GRAPH
+    // GGML_CUDA_NO_GRAPH_SPLIT=1 disables it; a head of 1/8 of the nodes was faster than 1/4
+    static const bool graph_split_enabled = !ggml_cuda_env_flag("GGML_CUDA_NO_GRAPH_SPLIT");
+    const int graph_split_node = graph_split_enabled && use_cuda_graph && cuda_graph_update_required && cgraph->n_nodes >= 64 ?
+        cgraph->n_nodes/8 : INT_MAX;
+#endif // USE_CUDA_GRAPH
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5044,6 +5068,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+#ifdef USE_CUDA_GRAPH
+                // i is at an op boundary here: fused nodes are skipped as a group
+                if (!graph_split_done && i >= graph_split_node && !is_concurrent_event_active) {
+                    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+                    if (graph->graph != nullptr) {
+                        CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                        graph->graph = nullptr;
+                    }
+                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+                    graph_split_done = true;
+                }
+#endif // USE_CUDA_GRAPH
                 if (!ggml_cuda_is_view_or_noop(node) && mmvq_cache.overlaps(node)) {
                     mmvq_cache.reset();
                 }
@@ -5141,12 +5178,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (graph->graph != nullptr) {
-                CUDA_CHECK(cudaGraphDestroy(graph->graph));
-                graph->graph = nullptr;
+            cudaGraph_t & captured = graph_split_done ? graph->graph_tail : graph->graph;
+            if (captured != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(captured));
+                captured = nullptr;
             }
 
-            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &captured));
+            if (!graph_split_done && graph->graph_tail != nullptr) {
+                CUDA_CHECK(cudaGraphDestroy(graph->graph_tail));
+                graph->graph_tail = nullptr;
+                if (graph->instance_tail != nullptr) {
+                    CUDA_CHECK(cudaGraphExecDestroy(graph->instance_tail));
+                    graph->instance_tail = nullptr;
+                }
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -5168,6 +5214,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (graph->instance_tail != nullptr) {
+            CUDA_CHECK(cudaGraphLaunch(graph->instance_tail, cuda_ctx->stream()));
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;

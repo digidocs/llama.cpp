@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
+#include "ggml-cuda/fp8.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1010,6 +1011,190 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// cuda FP8 buffer: BF16 weights stored as e4m3 values with a power-of-two scale per 32 values (see fp8.cuh),
+// converted when the weights are set and refused if a value is not exactly representable
+
+struct ggml_backend_cuda_fp8_buffer_context : ggml_backend_cuda_buffer_context {
+    using ggml_backend_cuda_buffer_context::ggml_backend_cuda_buffer_context;
+
+    // tensors set in several parts, converted once all bytes have arrived
+    std::mutex staging_mutex;
+    std::unordered_map<const ggml_tensor *, std::pair<std::vector<uint8_t>, size_t>> staging;
+};
+
+static void ggml_backend_cuda_fp8_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    delete (ggml_backend_cuda_fp8_buffer_context *) buffer->context;
+}
+
+static bool ggml_backend_buffer_is_cuda_fp8(ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == ggml_backend_cuda_fp8_buffer_free_buffer;
+}
+
+static bool ggml_cuda_fp8_tensor_supported(const ggml_tensor * tensor) {
+    return tensor->type == GGML_TYPE_BF16 && tensor->view_src == nullptr && ggml_is_contiguous(tensor) &&
+        tensor->ne[0] % GGML_CUDA_FP8_BLOCK == 0;
+}
+
+static enum ggml_status ggml_backend_cuda_fp8_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (tensor->view_src == nullptr && !ggml_cuda_fp8_tensor_supported(tensor)) {
+        GGML_LOG_ERROR("%s: tensor %s (%s) cannot be stored in %s\n", __func__, tensor->name, ggml_type_name(tensor->type),
+            ggml_backend_buft_name(buffer->buft));
+        return GGML_STATUS_FAILED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_cuda_fp8_upload(ggml_backend_cuda_fp8_buffer_context * ctx, ggml_tensor * tensor, const uint8_t * bf16) {
+    const int64_t n = ggml_nelements(tensor);
+    std::vector<uint8_t> packed(ggml_cuda_fp8_size(n));
+    if (!ggml_cuda_fp8_pack((const uint16_t *) bf16, n, packed.data(), packed.data() + n)) {
+        GGML_ABORT("tensor %s is not exactly representable as FP8 with a power-of-two scale per %d values; do not store it in an FP8 buffer",
+            tensor->name, GGML_CUDA_FP8_BLOCK);
+    }
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(tensor->data, packed.data(), packed.size(), cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+static void ggml_backend_cuda_fp8_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    auto * ctx = (ggml_backend_cuda_fp8_buffer_context *) buffer->context;
+    GGML_ASSERT(tensor->view_src == nullptr);
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (offset == 0 && size == nbytes) {
+        ggml_cuda_fp8_upload(ctx, tensor, (const uint8_t *) data);
+        return;
+    }
+
+    std::vector<uint8_t> complete;
+    {
+        std::lock_guard<std::mutex> lock(ctx->staging_mutex);
+        auto & stage = ctx->staging[tensor];
+        if (stage.first.empty()) {
+            stage.first.resize(nbytes);
+            stage.second = 0;
+        }
+        memcpy(stage.first.data() + offset, data, size);
+        stage.second += size;
+        if (stage.second < nbytes) {
+            return;
+        }
+        complete.swap(stage.first);
+        ctx->staging.erase(tensor);
+    }
+    ggml_cuda_fp8_upload(ctx, tensor, complete.data());
+}
+
+static void ggml_backend_cuda_fp8_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    auto * ctx = (ggml_backend_cuda_fp8_buffer_context *) buffer->context;
+    GGML_ASSERT(tensor->view_src == nullptr);
+
+    const int64_t n = ggml_nelements(tensor);
+    std::vector<uint8_t> packed(ggml_cuda_fp8_size(n));
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(packed.data(), tensor->data, packed.size(), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+
+    std::vector<uint16_t> bf16(n);
+    ggml_cuda_fp8_unpack(packed.data(), packed.data() + n, n, bf16.data());
+    memcpy(data, (const uint8_t *) bf16.data() + offset, size);
+}
+
+static void ggml_backend_cuda_fp8_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    GGML_ABORT("%s: memset of tensor %s in an FP8 buffer is not supported", __func__, tensor->name);
+    GGML_UNUSED_VARS(buffer, value, offset, size);
+}
+
+static bool ggml_backend_cuda_fp8_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    return false;
+    GGML_UNUSED_VARS(buffer, src, dst);
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_fp8_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_fp8_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_fp8_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_fp8_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_fp8_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_fp8_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_cuda_fp8_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+static const char * ggml_backend_cuda_fp8_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    return ((ggml_backend_cuda_buffer_type_context *) buft->context)->name.c_str();
+}
+
+static bool ggml_backend_buft_is_cuda_fp8(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_fp8_buffer_type_get_name;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_fp8_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    ggml_cuda_set_device(buft_ctx->device);
+
+    void * dev_ptr = nullptr;
+    if (size > 0) {
+        cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+            return nullptr;
+        }
+    }
+
+    auto * ctx = new ggml_backend_cuda_fp8_buffer_context(buft_ctx->device, dev_ptr);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_fp8_buffer_interface, ctx, size);
+}
+
+static size_t ggml_backend_cuda_fp8_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    if (!ggml_cuda_fp8_tensor_supported(tensor)) {
+        return ggml_nbytes(tensor);
+    }
+    return ggml_cuda_fp8_size(ggml_nelements(tensor));
+    GGML_UNUSED(buft);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_fp8_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_cuda_fp8_buffer_type_get_name,
+    /* .alloc_buffer        = */ ggml_backend_cuda_fp8_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL,
+    /* .get_alloc_size      = */ ggml_backend_cuda_fp8_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL,
+};
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_fp8_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_fp8_buffer_types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_cuda_fp8_buffer_types[i] = {
+                /* .iface    = */ ggml_backend_cuda_fp8_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_FP8"},
+            };
+        }
+        initialized = true;
+    }
+
+    return &ggml_backend_cuda_fp8_buffer_types[device];
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -2092,7 +2277,26 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], y->ne[1], y->ne[2]*y->ne[3], device);
 }
 
+// for paths without native FP8 support: a BF16 copy of a weight stored in an FP8 buffer, so the unchanged BF16 kernels
+// produce exactly the same result; returns t itself for other tensors
+static const ggml_tensor * ggml_cuda_fp8_as_bf16(ggml_backend_cuda_context & ctx, const ggml_tensor * t,
+        ggml_cuda_pool_alloc<nv_bfloat16> & buf, ggml_tensor & tmp) {
+    if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_cuda_fp8(t->buffer)) {
+        return t;
+    }
+    buf.alloc(ctx.pool(), ggml_nelements(t));
+    ggml_cuda_fp8_to_bf16(t->data, ggml_nelements(t), buf.get(), ctx.stream());
+    tmp        = *t;
+    tmp.data   = buf.get();
+    tmp.buffer = nullptr;
+    return &tmp;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_pool_alloc<nv_bfloat16> src0_fp8_buf;
+    ggml_tensor src0_fp8_tmp;
+    src0 = ggml_cuda_fp8_as_bf16(ctx, src0, src0_fp8_buf, src0_fp8_tmp);
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
@@ -2102,7 +2306,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+    const bool bad_padding_clear = src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -2739,6 +2943,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
+    if (ggml_backend_buffer_is_cuda_fp8(buf)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        buf->iface.set_tensor(buf, tensor, data, offset, size);
+        return;
+    }
+
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -2747,6 +2957,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    if (ggml_backend_buffer_is_cuda_fp8(buf)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        buf->iface.get_tensor(buf, tensor, data, offset, size);
+        return;
+    }
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
@@ -4508,7 +4724,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_pool_alloc<nv_bfloat16> fp8_buf, fp8_buf_gate;
+                ggml_tensor fp8_tmp, fp8_tmp_gate;
+                const ggml_tensor * src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
+                fusion_data.gate = ggml_cuda_fp8_as_bf16(*cuda_ctx, fusion_data.gate, fp8_buf_gate, fp8_tmp_gate);
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0_mm, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
@@ -4549,7 +4769,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_pool_alloc<nv_bfloat16> fp8_buf, fp8_buf_gate;
+                ggml_tensor fp8_tmp, fp8_tmp_gate;
+                const ggml_tensor * src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
+                fusion_data.gate = ggml_cuda_fp8_as_bf16(*cuda_ctx, fusion_data.gate, fp8_buf_gate, fp8_tmp_gate);
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0_mm, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -4719,7 +4943,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
-            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            ggml_cuda_pool_alloc<nv_bfloat16> fp8_buf;
+            ggml_tensor fp8_tmp;
+            const ggml_tensor * src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0_mm, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
@@ -4990,6 +5217,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                               node->src[j]->buffer->buft == ggml_backend_cuda_fp8_buffer_type(cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -5810,6 +6038,17 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // weights in an FP8 buffer can only be read by MUL_MAT as src0 on their own device
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_fp8(op->src[i]->buffer->buft)) {
+            ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)op->src[i]->buffer->buft->context;
+            if (op->op != GGML_OP_MUL_MAT || i != 0 || buft_ctx->device != dev_ctx->device ||
+                    !ggml_cuda_fp8_tensor_supported(op->src[i]) || op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                return false;
+            }
+        }
+    }
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
@@ -6286,7 +6525,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return ((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_fp8(buft)) && buft->device == dev) ||
+        (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -6438,8 +6678,24 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// extra buffer types of a device: weights in these are only used when requested, e.g. with --override-tensor
+static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    static std::vector<std::vector<ggml_backend_buffer_type_t>> extra_bufts = [] {
+        std::vector<std::vector<ggml_backend_buffer_type_t>> bufts(ggml_backend_cuda_get_device_count());
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); ++i) {
+            bufts[i] = { ggml_backend_cuda_fp8_buffer_type(i), nullptr };
+        }
+        return bufts;
+    }();
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return extra_bufts[device].data();
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *)ggml_backend_cuda_device_get_extra_bufts;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

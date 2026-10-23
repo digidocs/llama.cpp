@@ -1,4 +1,4 @@
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 prompts = [
   "Write a Python function that parses an ISO 8601 duration string like 'P3DT4H12M' into total seconds, with tests.",
   "Explain how a B-tree insertion works, step by step, including node splits.",
@@ -7,10 +7,13 @@ prompts = [
   "Refactor this into idiomatic Rust: a function that reads a file line by line, counts word frequencies, and prints the top 10.",
 ]
 tag = sys.argv[1]
+# THINK=1 enables reasoning, MAX_TOKENS overrides the per-prompt token budget
+think = os.environ.get("THINK") == "1"
+max_tokens = int(os.environ.get("MAX_TOKENS", 700))
 tot_n = tot_t = dn = da = 0
 for i, p in enumerate(prompts):
-    body = {"messages": [{"role": "user", "content": p}], "max_tokens": 700, "seed": 1000 + i,
-            "chat_template_kwargs": {"enable_thinking": False}}
+    body = {"messages": [{"role": "user", "content": p}], "max_tokens": max_tokens, "seed": 1000 + i,
+            "chat_template_kwargs": {"enable_thinking": think}}
     req = urllib.request.Request("http://127.0.0.1:8011/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
     r = json.load(urllib.request.urlopen(req, timeout=3600))
     t = r.get("timings", {})

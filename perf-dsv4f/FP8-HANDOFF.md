@@ -83,6 +83,14 @@ Dispatch for a BF16 src0 on the 3090 (sm_86), from `ggml_cuda_mul_mat` in `ggml-
 - `src/llama-model-loader.cpp`: an override to a GPU extra buffer type is checked with `weight_buft_supported`; if the weight's op isn't supported there, it keeps the default with a warning.
 - Usage: `-ot 'blk\.[0-9]+\.(attn_output_[ab]|attn_q_[ab]|attn_kv|indexer\.attn_q_b|ffn_(gate|up|down)_shexp)\.weight=CUDA0_FP8'`
 
+### 6. Performance findings (2026-10-23 night)
+
+- First native FP8 kernels gave **no speedup**: per-call times equal to BF16. nsys with `--cuda-graph-trace=node` (without it the kernels inside CUDA graphs are invisible) showed the BF16 kernels at only 620-750 GB/s for these shapes, so they are latency/issue bound, not bandwidth bound; the FP8 decode (several integer ops per weight) then made them ALU bound.
+- **Fix 1, cheaper exact decode** (`ggml_cuda_fp8x2_e4m3_scaled`): an e4m3 byte placed in FP16 exponent/mantissa bits is exactly the value times 2^-8 (subnormals too), so two weights decode with a byte permute, two masks/shifts, one `__half22float2` and one multiply by the power-of-two scale. Note the build uses `-use_fast_math` (float subnormals flush to zero), so decodes must never produce float subnormals; FP16 subnormal inputs convert exactly.
+- **Fix 2, `mul_mat_vec_f_vt`**: the block-wide `mul_mat_vec_f` kernel (one row per 256-thread block) is replayed with fewer real threads: lane l of warp r does the work of the original threads l + 32*(r + R*j) and the same per-warp butterflies plus the second-stage butterfly over the zero-padded warp sums are replayed, so the result is bit-identical. R=1 (one warp per row) is faster for short rows (`attn_q_b`: 32768 rows x 1024; 108 -> 81 us BF16, 72 us FP8) and slower for long rows; it is used when each original thread has <= 2 iterations. R=2/4 for long rows is being tuned (`TMP_MMVF_VT_LONG_R`, temporary).
+- Per-call times after both fixes (us, BF16 -> FP8): attn_output_b + ffn_down_shexp 49.6 -> 30.3, shexp gate+up fused 41.6 -> 25.8, attn_output_a (mmf) 85.4 -> 57.4, attn_q_b 108 -> 72. GPU busy over 300 tokens 7.30 s (original BF16) -> 5.76 s (FP8).
+- Profiling recipe: `PREFIX="nsys profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none -o <file>" TAG=x perf-dsv4f/md5_q8.sh [-ot ...]`, then `nsys export -t sqlite` and the per-kernel scripts `perf-dsv4f/kern.py` (totals) / `perf-dsv4f/kern2.py` (by template instance and grid).
+
 ## Verification references (current build, `perf/dsv4-flash-profile` `eddc42ce0`)
 
 The scripts are in `perf-dsv4f/`. Logs and outputs go to `~/dsv4f-work/`. Every load uses `-lm dio` (about 76 s to ready).
@@ -110,8 +118,9 @@ Q4_K_XL quantizes these dense tensors itself (lossy), so FP8 storage only applie
 | 1 | Read the current BF16 paths (section 3), write findings here | done, see section 4 |
 | 2 | `CUDA0_FP8` buffer type: alloc size, exact `set_tensor`, `get_tensor`, op refusal, `-ot` registration (`common/arg.cpp`), support check for overrides in the loader | done |
 | 3 | Safety net: MXFP8 -> BF16 expansion feeding the existing paths (all of mmvf, mmf and cuBLAS at first) | done: Q8 md5 `1129672c4d2a` identical, weights 13,004 -> 7,592 MiB, 6.3 GB free at 450K, 12.0 t/s (expansion on every call) |
-| 4a | Native FP8 in `mul_mat_vec_f` (2D weights at 1 token, including the gate/GLU fusion) | next |
-| 4b | Native FP8 in `mul_mat_f` (wo_a at every batch size, all weights at 2-16 tokens) | |
+| 4a | Native FP8 in `mul_mat_vec_f` (2D weights at 1 token, including the gate/GLU fusion) | done (`18d0034f5`), bit-identical |
+| 4b | Native FP8 in `mul_mat_f` (wo_a at every batch size, all weights at 2-16 tokens) | done (`18d0034f5`), bit-identical |
+| 4c | Faster exact FP8 decode (FP16-bits trick) + one-warp-per-row mat-vec for short rows (`mul_mat_vec_f_vt`) | done (`see git log`), bit-identical, GPU time ~5 ms/token lower than BF16 |
 | 5 | Bitwise tests: FP8 vs BF16 weights, batch 1-4 and large; `test-backend-ops` if it fits | |
 | 6 | Full verification: md5s (all 4 configs), pp, VRAM, speed | |
 | 7 | Use the freed VRAM (Q8 + DSpark at 450K?), scripts, README, commit | |

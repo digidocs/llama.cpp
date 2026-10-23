@@ -456,168 +456,226 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
-// One warp per row for a single column of BF16 or FP8 weights: lane l does the work of the threads l + warp_size*w
-// (w < nvw) of the block-wide kernel above with block_size = nvw*warp_size. Every per-thread partial sum gets the same
-// multiply-adds in the same order and the warp and block reductions are replayed with the same butterflies, so the result
-// is bit-identical, while each lane has nvw independent loads in flight and no block synchronization is needed.
-template <typename T, int nvw, bool has_fusion>
+// M rows in R warps for a single column of BF16 or FP8 weights: lane l of warp r does the work of the threads
+// l + warp_size*(r + R*j) of the block-wide kernel above with block_size = nvw*warp_size, for each of the M rows. Every
+// per-thread partial sum gets the same multiply-adds in the same order and the warp and block reductions are replayed
+// with the same butterflies, so the result is bit-identical, while each lane has nj*M independent loads in flight and
+// loads each element of y once for the M rows.
+template <typename T, int nvw, int R, int M, bool has_fusion>
 static __global__ void mul_mat_vec_f_vt(
         const T * x_ptr, const float * y, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int ncols2, const int stride_row, const int nrows) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    static_assert(nvw % R == 0, "R must divide nvw");
+    constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int block_size = nvw*warp_size;
+    constexpr int nj         = nvw/R;
 
-    const int row  = blockIdx.x*blockDim.y + threadIdx.y;
-    const int lane = threadIdx.x;
+    const int group_local = threadIdx.y / R;
+    const int rw          = threadIdx.y % R;
+    const int row0        = (blockIdx.x*(blockDim.y/R) + group_local)*M;
+    const int lane        = threadIdx.x;
 
     ggml_cuda_pdl_sync();
-    if (row >= nrows) {
+    if (R == 1 && row0 >= nrows) {
         return;
     }
 
-    const int64_t  x_offset = (int64_t) row*stride_row;
-    const float2 * y2       = (const float2 *) y;
+    const float2 * y2 = (const float2 *) y;
 
     [[maybe_unused]] const bool use_gate = has_fusion && fusion.gate != nullptr;
 
-    float sumf[nvw];
-    float sumf_gate[nvw];
+    float sumf[M][nj];
+    float sumf_gate[M][nj];
 #pragma unroll
-    for (int w = 0; w < nvw; ++w) {
-        sumf[w]      = 0.0f;
-        sumf_gate[w] = 0.0f;
+    for (int m = 0; m < M; ++m) {
+#pragma unroll
+        for (int j = 0; j < nj; ++j) {
+            sumf[m][j]      = 0.0f;
+            sumf_gate[m][j] = 0.0f;
+        }
     }
 
-    if constexpr (std::is_same_v<T, nv_bfloat16>) {
-        const nv_bfloat162 * x2      = (const nv_bfloat162 *) (x_ptr + x_offset);
-        const nv_bfloat162 * gate_x2 = has_fusion && use_gate ? (const nv_bfloat162 *) ((const nv_bfloat16 *) fusion.gate + x_offset) : nullptr;
-        for (int c0 = 0; c0 < ncols2; c0 += block_size) {
+    // rows past the end read row 0 and are not written
+    int64_t x_offset[M];
 #pragma unroll
-            for (int w = 0; w < nvw; ++w) {
-                const int col2 = c0 + w*warp_size + lane;
-                if (col2 < ncols2) {
-                    const nv_bfloat162 tmpx = x2[col2];
-                    const float2       tmpy = y2[col2];
-                    ggml_cuda_mad(sumf[w], tmpx.x, tmpy.x);
-                    ggml_cuda_mad(sumf[w], tmpx.y, tmpy.y);
+    for (int m = 0; m < M; ++m) {
+        x_offset[m] = (int64_t) (row0 + m < nrows ? row0 + m : 0)*stride_row;
+    }
+
+    for (int c0 = 0; c0 < ncols2; c0 += block_size) {
+#pragma unroll
+        for (int j = 0; j < nj; ++j) {
+            const int col2 = c0 + (rw + R*j)*warp_size + lane;
+            if (col2 >= ncols2) {
+                continue;
+            }
+            const float2 tmpy = y2[col2];
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                float2 tmpx;
+                [[maybe_unused]] float2 tmpx_gate;
+                if constexpr (std::is_same_v<T, nv_bfloat16>) {
+                    const nv_bfloat162 v = ((const nv_bfloat162 *) (x_ptr + x_offset[m]))[col2];
+                    tmpx = make_float2(v.x, v.y);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            const nv_bfloat162 tmpx_gate = gate_x2[col2];
-                            ggml_cuda_mad(sumf_gate[w], tmpx_gate.x, tmpy.x);
-                            ggml_cuda_mad(sumf_gate[w], tmpx_gate.y, tmpy.y);
+                            const nv_bfloat162 vg = ((const nv_bfloat162 *) ((const nv_bfloat16 *) fusion.gate + x_offset[m]))[col2];
+                            tmpx_gate = make_float2(vg.x, vg.y);
                         }
+                    }
+                } else if constexpr (std::is_same_v<T, ggml_cuda_fp8_t>) {
+                    const uint8_t * xq = (const uint8_t *) x_ptr;
+                    tmpx = ggml_cuda_fp8x2_e4m3_scaled(((const uint16_t *) (xq + x_offset[m]))[col2],
+                        xq[fusion.fp8_n_x + (x_offset[m] + 2*col2)/GGML_CUDA_FP8_BLOCK]);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            const uint8_t * gq = (const uint8_t *) fusion.gate;
+                            tmpx_gate = ggml_cuda_fp8x2_e4m3_scaled(((const uint16_t *) (gq + x_offset[m]))[col2],
+                                gq[fusion.fp8_n_gate + (x_offset[m] + 2*col2)/GGML_CUDA_FP8_BLOCK]);
+                        }
+                    }
+                } else {
+                    static_assert(std::is_same_v<T, void>, "unsupported type");
+                }
+                ggml_cuda_mad(sumf[m][j], tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf[m][j], tmpx.y, tmpy.y);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        ggml_cuda_mad(sumf_gate[m][j], tmpx_gate.x, tmpy.x);
+                        ggml_cuda_mad(sumf_gate[m][j], tmpx_gate.y, tmpy.y);
                     }
                 }
             }
         }
-    } else if constexpr (std::is_same_v<T, ggml_cuda_fp8_t>) {
-        const uint16_t * x2       = (const uint16_t *) (x_ptr + x_offset);
-        const uint8_t  * x_scales = (const uint8_t *) x_ptr + fusion.fp8_n_x + x_offset/GGML_CUDA_FP8_BLOCK;
-        const uint16_t * gate_x2       = has_fusion && use_gate ? (const uint16_t *) ((const uint8_t *) fusion.gate + x_offset) : nullptr;
-        const uint8_t  * gate_x_scales = has_fusion && use_gate ? (const uint8_t *) fusion.gate + fusion.fp8_n_gate + x_offset/GGML_CUDA_FP8_BLOCK : nullptr;
-        for (int c0 = 0; c0 < ncols2; c0 += block_size) {
-#pragma unroll
-            for (int w = 0; w < nvw; ++w) {
-                const int col2 = c0 + w*warp_size + lane;
-                if (col2 < ncols2) {
-                    const float2 tmpx = ggml_cuda_fp8x2_e4m3_scaled(x2[col2], x_scales[col2/(GGML_CUDA_FP8_BLOCK/2)]);
-                    const float2 tmpy = y2[col2];
-                    ggml_cuda_mad(sumf[w], tmpx.x, tmpy.x);
-                    ggml_cuda_mad(sumf[w], tmpx.y, tmpy.y);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            const float2 tmpx_gate = ggml_cuda_fp8x2_e4m3_scaled(gate_x2[col2], gate_x_scales[col2/(GGML_CUDA_FP8_BLOCK/2)]);
-                            ggml_cuda_mad(sumf_gate[w], tmpx_gate.x, tmpy.x);
-                            ggml_cuda_mad(sumf_gate[w], tmpx_gate.y, tmpy.y);
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        static_assert(std::is_same_v<T, void>, "unsupported type");
     }
 
     ggml_cuda_pdl_lc();
 
     // per-warp butterflies of the block-wide kernel, then its second stage over the warp sums padded with zeros
 #pragma unroll
-    for (int w = 0; w < nvw; ++w) {
-        sumf[w] = warp_reduce_sum<warp_size>(sumf[w]);
-        if constexpr (has_fusion) {
-            if (use_gate) {
-                sumf_gate[w] = warp_reduce_sum<warp_size>(sumf_gate[w]);
-            }
-        }
-    }
-    float value      = sumf[0];
-    float gate_value = sumf_gate[0];
-    if constexpr (nvw > 1) {
-        float b = 0.0f;
-        float b_gate = 0.0f;
+    for (int m = 0; m < M; ++m) {
 #pragma unroll
-        for (int w = 0; w < nvw; ++w) {
-            if (lane == w) {
-                b      = sumf[w];
-                b_gate = sumf_gate[w];
-            }
-        }
-        value = warp_reduce_sum<warp_size>(b);
-        if constexpr (has_fusion) {
-            if (use_gate) {
-                gate_value = warp_reduce_sum<warp_size>(b_gate);
-            }
-        }
-    }
-
-    if (lane != 0) {
-        return;
-    }
-
-    if constexpr (has_fusion) {
-        if (fusion.x_bias != nullptr) {
-            value += ((const float *) fusion.x_bias)[row];
-        }
-        if (use_gate) {
-            if (fusion.gate_bias != nullptr) {
-                gate_value += ((const float *) fusion.gate_bias)[row];
-            }
-            switch (fusion.glu_op) {
-                case GGML_GLU_OP_SWIGLU:
-                    value *= ggml_cuda_op_silu_single(gate_value);
-                    break;
-                case GGML_GLU_OP_GEGLU:
-                    value *= ggml_cuda_op_gelu_single(gate_value);
-                    break;
-                case GGML_GLU_OP_SWIGLU_OAI: {
-                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
-                    break;
+        for (int j = 0; j < nj; ++j) {
+            sumf[m][j] = warp_reduce_sum<warp_size>(sumf[m][j]);
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    sumf_gate[m][j] = warp_reduce_sum<warp_size>(sumf_gate[m][j]);
                 }
-                case GGML_GLU_OP_SWIGLU_CLAMP:
-                    value = ggml_cuda_op_swiglu_clamp_single(gate_value, value, fusion.glu_limit);
-                    break;
-                default:
-                    break;
             }
         }
     }
 
-    dst[row] = value;
+    float b[M];
+    float b_gate[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        b[m]      = 0.0f;
+        b_gate[m] = 0.0f;
+    }
+    if constexpr (R == 1) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+#pragma unroll
+            for (int j = 0; j < nj; ++j) {
+                if (lane == j) {
+                    b[m]      = sumf[m][j];
+                    b_gate[m] = sumf_gate[m][j];
+                }
+            }
+        }
+    } else {
+        __shared__ float buf[32][M][nvw];
+        __shared__ float buf_gate[32][M][nvw];
+        if (lane == 0) {
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+#pragma unroll
+                for (int j = 0; j < nj; ++j) {
+                    buf[group_local][m][rw + R*j] = sumf[m][j];
+                    if constexpr (has_fusion) {
+                        buf_gate[group_local][m][rw + R*j] = sumf_gate[m][j];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (rw != 0 || row0 >= nrows) {
+            return;
+        }
+        if (lane < nvw) {
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                b[m] = buf[group_local][m][lane];
+                if constexpr (has_fusion) {
+                    b_gate[m] = buf_gate[group_local][m][lane];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        float value      = sumf[m][0];
+        float gate_value = sumf_gate[m][0];
+        if constexpr (nvw > 1) {
+            value = warp_reduce_sum<warp_size>(b[m]);
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    gate_value = warp_reduce_sum<warp_size>(b_gate[m]);
+                }
+            }
+        }
+
+        const int row = row0 + m;
+        if (lane != 0 || row >= nrows) {
+            continue;
+        }
+
+        if constexpr (has_fusion) {
+            if (fusion.x_bias != nullptr) {
+                value += ((const float *) fusion.x_bias)[row];
+            }
+            if (use_gate) {
+                if (fusion.gate_bias != nullptr) {
+                    gate_value += ((const float *) fusion.gate_bias)[row];
+                }
+                switch (fusion.glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        value *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        value *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI: {
+                        value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                        break;
+                    }
+                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                        value = ggml_cuda_op_swiglu_clamp_single(gate_value, value, fusion.glu_limit);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        dst[row] = value;
+    }
 }
 
-template <typename T, int nvw>
+template <typename T, int nvw, int R, int M>
 static void launch_mul_mat_vec_f_vt(
         const T * x, const float * y, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int64_t ncols, const int64_t nrows, const int64_t stride_row, cudaStream_t stream) {
-    constexpr int rows_per_block = 4;
-    const dim3 block_dims(32, rows_per_block, 1); // only used with a warp size of 32
-    const dim3 block_nums((nrows + rows_per_block - 1)/rows_per_block, 1, 1);
+    constexpr int groups_per_block = R == 1 ? 4 : (R == 2 ? 2 : 1);
+    const dim3 block_dims(32, R*groups_per_block, 1); // only used with a warp size of 32
+    const dim3 block_nums((nrows + groups_per_block*M - 1)/(groups_per_block*M), 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_f_vt<T, nvw, true>, launch_params, x, y, fusion, dst, (int) (ncols/2), (int) stride_row, (int) nrows);
+        ggml_cuda_kernel_launch(mul_mat_vec_f_vt<T, nvw, R, M, true>, launch_params, x, y, fusion, dst, (int) (ncols/2), (int) stride_row, (int) nrows);
     } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_f_vt<T, nvw, false>, launch_params, x, y, fusion, dst, (int) (ncols/2), (int) stride_row, (int) nrows);
+        ggml_cuda_kernel_launch(mul_mat_vec_f_vt<T, nvw, R, M, false>, launch_params, x, y, fusion, dst, (int) (ncols/2), (int) stride_row, (int) nrows);
     }
 }
 
@@ -667,17 +725,18 @@ void launch_mul_mat_vec_f_cuda(
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if constexpr (ncols_dst == 1 && !is_multi_token_id && (std::is_same_v<T, nv_bfloat16> || std::is_same_v<T, ggml_cuda_fp8_t>)) {
-        // faster for short rows (few iterations per thread), slower for long rows where fewer warps run
+        // short rows (at most two iterations per thread of the block-wide kernel): one warp per row, two rows per warp
+        // sharing the loads of y; long rows are faster with the block-wide kernel
         if (ids == nullptr && nchannels_dst == 1 && nsamples_dst == 1 && warp_size == 32 && niter_best <= 2 && ggml_cuda_mmvf_vt_enabled()) {
             switch (block_size_best) {
-                case  32: launch_mul_mat_vec_f_vt<T, 1>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
-                case  64: launch_mul_mat_vec_f_vt<T, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
-                case  96: launch_mul_mat_vec_f_vt<T, 3>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
-                case 128: launch_mul_mat_vec_f_vt<T, 4>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
-                case 160: launch_mul_mat_vec_f_vt<T, 5>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
-                case 192: launch_mul_mat_vec_f_vt<T, 6>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
-                case 224: launch_mul_mat_vec_f_vt<T, 7>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
-                case 256: launch_mul_mat_vec_f_vt<T, 8>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case  32: launch_mul_mat_vec_f_vt<T, 1, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case  64: launch_mul_mat_vec_f_vt<T, 2, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case  96: launch_mul_mat_vec_f_vt<T, 3, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case 128: launch_mul_mat_vec_f_vt<T, 4, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case 160: launch_mul_mat_vec_f_vt<T, 5, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case 192: launch_mul_mat_vec_f_vt<T, 6, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case 224: launch_mul_mat_vec_f_vt<T, 7, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
+                case 256: launch_mul_mat_vec_f_vt<T, 8, 1, 2>(x, y, fusion, dst, ncols, nrows, stride_row, stream); return;
                 default: break;
             }
         }

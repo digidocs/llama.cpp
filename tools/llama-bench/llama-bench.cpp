@@ -953,6 +953,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         if (buft) {
                             buft_list[ggml_backend_buft_name(buft)] = buft;
                         }
+                        // extra buffer types of GPU devices (e.g. alternative weight storage) can only be selected here
+                        auto * reg = ggml_backend_dev_backend_reg(dev);
+                        auto get_extra_bufts = reg && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU ?
+                            (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+                        if (get_extra_bufts) {
+                            for (auto * extra = get_extra_bufts(dev); extra && *extra; ++extra) {
+                                buft_list[ggml_backend_buft_name(*extra)] = *extra;
+                            }
+                        }
                     }
                 }
                 auto override_group_span_len = std::strcspn(value, ",");

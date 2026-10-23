@@ -62,7 +62,7 @@ Draft settings (server, Q4_K_XL, 450K, ub 6144), before and after the fix:
 - The top configurations (n3/p0.7, n2, n2/p0.5, n1) are within about the +-0.4 t/s run-to-run noise; n3/p0.7 is the best measured, +9.8% over the controls.
 - DSpark is a block drafter (`block_size=5`): one draft pass per step, whatever n-max is. The cost of longer drafts is in verification: each extra verified token costs nearly a full set of CPU expert reads (tokens route to different experts), and only the ~15 ms GPU part is shared across the batch. Acceptance depends strongly on the prompt (the hardest test prompt had 59% at n-max 1).
 - Q8_K_XL at 350K, thinking off (5 prompts x 700 tokens): n-max 1 18.25 t/s (82.5%), n-max 3 / p-min 0.7 18.33 t/s (86.2%). On the hardest prompt (p3, prose) n3/p0.7 fell slightly below no draft (15.24 vs 15.49 t/s; n1 16.38).
-- No MTP head in this GGUF (no `mtp`/`nextn` tensors), so `draft-mtp` is not an option. The Q2K-Q4K draft was not tested.
+- No MTP head in this GGUF (no `mtp`/`nextn` tensors), so `draft-mtp` is not an option. The Q2K-Q4K draft was not tested and has been deleted.
 
 ### Reasoning (thinking on), Q8_K_XL
 
@@ -306,7 +306,7 @@ The target model verifies every drafted token, so the output is exactly what pla
 
 Draft files (`architecture = dflash`, 3 layers, 256 experts):
 - `dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf` (used below): 10.9 GB; experts MXFP4 (10.3 GB), dense q8_0 + markov weights
-- `DeepSeek-V4-Flash-0731-DSpark-Q2K-Q4K.gguf`: 8.4 GB; experts q2_K/q4_K, no markov weights (not tested)
+- `DeepSeek-V4-Flash-0731-DSpark-Q2K-Q4K.gguf`: 8.4 GB; experts q2_K/q4_K, no markov weights (not tested, deleted 2026-10-24)
 
 With `-ncmoed 999` the draft's experts go to system RAM and its VRAM weights are only 594 MB.
 
@@ -335,7 +335,7 @@ Required flags beyond ds4f.sh:
 
 **Tried and dropped:** making the private-src1 copy a `memcpy` from the shared quantized buffer (to cover bigger verify batches) was 7-11% *slower* than each thread quantizing redundantly. Every thread reading lines that 20 different cores just wrote, all at once, is costly. Raising the private-src1 limit from 32 KB to 128 KB made no measurable difference. Both reverted.
 
-Not yet tried: the Q2K-Q4K draft, `--spec-type draft-mtp` (built-in MTP head), 300K context.
+Not yet tried: `--spec-type draft-mtp` (built-in MTP head; needs the MTP tensors from the official checkpoint), n-gram drafting. The Q2K-Q4K draft was deleted untested.
 
 ### Short prompts (done): batched MXFP4 kernel + offload threshold
 Time to first token for chat follow-ups was dominated by prompt processing of *short* prompts. There was no other lag: in a timed two-turn chat (`chat_timing.py` style client), wall time = server prompt time + generation time to within 0.05 s. A 197-token follow-up took 7.1 s (28 t/s).

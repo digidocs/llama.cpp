@@ -20,7 +20,8 @@ All output byte-identical to the previous build (md5 of every reply; Q4 + DSpark
 - Measured and dropped: more warps per row / more rows per warp for long rows; register double-buffering of FP8 loads in `mul_mat_f` (57 -> 71 us, occupancy); `cuStreamWaitValue32` to pre-launch graphs (stream memory ops are disabled on this driver: the attribute is 0 and the wait hangs).
 - Head/tail graph capture cut the GPU wait after each per-layer launch from ~55 to ~26 us (2.7 -> 1.1 ms/token of idle GPU) but only gave +0.5% end to end.
 - With DSpark the GPU is only ~18% of a verify step (CPU experts dominate, at the DRAM limit), so further GPU work mostly helps the no-draft path. Remaining GPU time per token (no draft, ~19 ms): FP8 matmuls ~8 ms, BF16 `output` head 1.2 ms (at bandwidth), ~2,100 small kernels 5.7 ms (rms_norm 1.0, flash attn 0.7, concat 0.5, ...), `attn_output_a` (mmf) 2.5 ms.
-- Possible next steps: bit-exact fusions of small kernels (~2-3 us each); the `attn_output_a` tensor-core path; merging this branch back into `perf/dsv4-flash-profile` and pushing.
+- Most frequent op pairs still run as separate kernels (decode, per token, after existing fusions): RMS_NORM(+MUL) -> ROPE 178 (`kv`, `q`, `csa/hca/lid_state_compress`), RMS_NORM(+MUL) -> MUL_MAT 130, GET_ROWS -> SET_ROWS 125 (the compressor state persist copies; source and destination are the same state cache, so a one-kernel copy is unsafe and the fusion memory check would refuse it), ADD -> CONCAT 83. A norm -> rope fusion would save ~0.3 ms/token but must reproduce each rope variant bit for bit.
+- Possible next steps: the norm -> rope fusion; the `attn_output_a` tensor-core path; merging this branch back into `perf/dsv4-flash-profile` and pushing.
 
 ## Goal
 

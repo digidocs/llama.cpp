@@ -25,7 +25,7 @@ All output byte-identical to the previous build (md5 of every reply; Q4 + DSpark
 
 ## Is it bit-exact?
 
-Yes, by construction, and by every test run so far. The tests compare the generated text (md5), not the logits.
+Yes: by construction, by md5 of the generated text, and at the logit level (`kld_check.sh`, below).
 
 **By construction**
 - **Weights.** Only tensors whose every value is exactly an e4m3 number times a power-of-two scale per 32 values are stored as FP8. The scan found this all-or-nothing per tensor kind: every block of the 9 FP8-origin kinds passes, every block of the true-BF16 kinds fails. `set_tensor` checks every block on every load and aborts the load if any value is not exact, so each stored weight decodes to exactly its BF16 value.
@@ -45,9 +45,20 @@ Yes, by construction, and by every test run so far. The tests compare the genera
 
 Sampling is at temperature 1.0, so a change in any logit would almost always change a token within a few hundred tokens.
 
+**Logits (`kld_check.sh`, Q8_K_XL, 2 x 512 tokens, FP8 storage vs BF16 reference logits)**
+
+FP8 matches Q8's identical-rerun floor exactly, in every printed figure. The floor is non-zero because `--kl-divergence-base` stores the reference logits in 16 bits.
+
+| | BF16 rerun (floor) | FP8 vs BF16 |
+|---|---|---|
+| decode (UB=1): mean PPL / mean ln(PPL ratio) / max KLD | 4.130426 / 0.004877 / 0.000043 | 4.130426 / 0.004877 / 0.000043 |
+| prefill (UB=512): mean PPL / mean ln(PPL ratio) / max KLD | 4.150460 / 0.005704 / 0.000044 | 4.150460 / 0.005704 / 0.000044 |
+| same top-1 | 100% | 100% |
+
+Command: `MODEL=<Q8_K_XL> LOAD_MODE=dio UB=1 perf-dsv4f/kld_check.sh base ref.kld`, then `... EXTRA="-ot <FP8 regex>" perf-dsv4f/kld_check.sh cmp ref.kld fp8`. Repeat both with `UB=512`.
+
 **Not yet tested**
-- `kld_check.sh` (logit-level comparison). It would also cover large-batch prompt processing directly; that path runs unchanged BF16 code after expansion.
-- Prompts far beyond 9K tokens; none of the changed kernels depends on context length.
+- Prompts far beyond 9K tokens. None of the changed kernels depends on context length.
 
 ## Goal
 

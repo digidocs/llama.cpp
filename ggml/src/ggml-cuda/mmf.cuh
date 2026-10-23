@@ -185,11 +185,10 @@ static __global__ void mul_mat_f(
                 if constexpr (x_fp8 && std::is_same_v<T, nv_bfloat162>) {
                     // decode to the BF16 pair the weight holds, so the MMA inputs are the same
                     const int64_t  ip = x_offset + (itA*tile_A::I + i)*stride_row + col;
-                    const uint32_t q  = x_q[ip];
-                    const uint32_t sc = ((const uint8_t *) ids)[ip/(GGML_CUDA_FP8_BLOCK/2)];
+                    const float2 f = ggml_cuda_fp8x2_e4m3_scaled(x_q[ip], ((const uint8_t *) ids)[ip/(GGML_CUDA_FP8_BLOCK/2)]);
                     nv_bfloat162 v;
-                    v.x = __ushort_as_bfloat16((unsigned short) (__float_as_uint(ggml_cuda_fp8_e4m3_scaled(q & 0xFF, sc)) >> 16));
-                    v.y = __ushort_as_bfloat16((unsigned short) (__float_as_uint(ggml_cuda_fp8_e4m3_scaled(q >> 8,   sc)) >> 16));
+                    v.x = __ushort_as_bfloat16((unsigned short) (__float_as_uint(f.x) >> 16));
+                    v.y = __ushort_as_bfloat16((unsigned short) (__float_as_uint(f.y) >> 16));
                     tile_xy[i*tile_k_padded + threadIdx.x] = v;
                 } else {
                     tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];

@@ -29,6 +29,17 @@ struct ggml_cuda_fp8_t {
 // true if the tensor is a BF16 weight held in a CUDA FP8 buffer
 bool ggml_cuda_tensor_is_fp8(const ggml_tensor * tensor);
 
+// exact values of the two e4m3 bytes of q times 2^(scale - 127): an e4m3 byte placed in the exponent and mantissa of an
+// FP16 value is that value times 2^-8 (subnormals included), and FP16 -> FP32 conversion and multiplying by a power of
+// two are exact
+static __device__ __forceinline__ float2 ggml_cuda_fp8x2_e4m3_scaled(const uint32_t q, const uint32_t scale) {
+    const uint32_t b = __byte_perm(q, 0, 0x7170); // byte 0 -> bits 0-7, byte 1 -> bits 16-23
+    const uint32_t h = ((b & 0x00800080) << 8) | ((b & 0x007F007F) << 7);
+    const float2   f = __half22float2(*reinterpret_cast<const half2 *>(&h));
+    const float    p2 = __uint_as_float((scale + 8) << 23);
+    return make_float2(f.x*p2, f.y*p2);
+}
+
 // exact value of an e4m3 byte times 2^(scale - 127): an integer mantissa times a power of two, both normal floats
 // (no subnormals, which -use_fast_math would flush) and no branches
 static __device__ __forceinline__ float ggml_cuda_fp8_e4m3_scaled(const uint32_t q, const uint32_t scale) {

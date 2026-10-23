@@ -4,20 +4,23 @@ Branch: `feat/fp8-dense` (off `perf/dsv4-flash-profile` at `eddc42ce0`). Fork re
 
 ## Morning summary (2026-10-24)
 
-All output byte-identical to the previous build (md5 of every reply). Q8_K_XL with the FP8-origin dense weights stored as FP8 in VRAM:
+All output byte-identical to the previous build (md5 of every reply; Q4 + DSpark also still `349af7bedf9c`). Q8_K_XL with the FP8-origin dense weights stored as FP8 in VRAM, final build `3a7caae37`:
 
-| | before (17.24 / 19.65 at 350K) | now |
+| | before | now |
 |---|---|---|
-| Q8, no draft, 450K, 5 prompts x 700 tokens | 17.24 t/s | **18.68 t/s** (+8.4%) |
-| Q8 + DSpark n3/p0.7 | 19.65 t/s at 350K | **20.16-20.23 t/s at 450K** |
-| pp, 9K prompt | 208.8 | 208.6 |
-| dense weights in VRAM | 13.0 GB | 7.6 GB |
+| Q8, no draft, 450K, 5 prompts x 700 tokens | 17.24 t/s | **18.59-18.68 t/s** (+8%) |
+| Q8 + DSpark n3/p0.7 | 19.65 t/s at 350K | **20.23 t/s at 450K** |
+| pp, 9K prompt | 208.8 | 208.2 |
+| dense weights in VRAM | 13.0 GB | 7.6 GB (~19 GB used with DSpark at 450K) |
 | load to ready | ~76 s | ~82 s |
 
 - `~/ds4f.sh` and `~/ds4f-dspark.sh` use the FP8 storage (`-ot ...=CUDA0_FP8`); the DSpark script is now at 450K. Backups: `~/old-scripts/*.pre-fp8`.
-- Commits on `feat/fp8-dense`: buffer type + BF16 expansion path, native FP8 in mmvf/mmf, fast exact decode + one-warp-per-row kernel, two rows per warp. Not pushed.
-- What did not help (measured, reverted): more warps per row or more rows per warp for long rows; register double-buffering of FP8 loads in `mul_mat_f` (57 -> 71 us, occupancy loss).
-- With DSpark the GPU is only ~18% of a verify step (CPU experts dominate, at the DRAM limit), so further GPU work mostly helps the no-draft path (GPU ~35% of a token). Remaining GPU time per token (no draft, ~19 ms): FP8 matmuls ~8 ms, BF16 `output` head 1.2 ms (at bandwidth), ~2,100 small kernels 5.7 ms (rms_norm 1.0, flash attn 0.7, concat 0.5, ...), `attn_output_a` (mmf) 2.5 ms.
+- Q8_K_XL + FP8 now reads about the same dense bytes as Q4_K_XL (whose dense weights are lossy Q8_0) and is within ~3% of its speed (Q4: 19.25 no draft, 20.91 DSpark), losslessly. The rest of the gap is mostly tensors that are true BF16 in Q8 (`output` head 1.0 GB vs 0.5 GB Q8_0), which cannot be stored exactly in 8 bits.
+- Commits on `feat/fp8-dense` (not pushed): FP8 buffer type + BF16 expansion path (`3d610ed49`), native FP8 in mmvf/mmf (`18d0034f5`), fast exact decode + one-warp-per-row kernel (`8e4eb969f`), two rows per warp (`09dba3342`), head/tail graph capture (`3a7caae37`).
+- Measured and dropped: more warps per row / more rows per warp for long rows; register double-buffering of FP8 loads in `mul_mat_f` (57 -> 71 us, occupancy); `cuStreamWaitValue32` to pre-launch graphs (stream memory ops are disabled on this driver: the attribute is 0 and the wait hangs).
+- Head/tail graph capture cut the GPU wait after each per-layer launch from ~55 to ~26 us (2.7 -> 1.1 ms/token of idle GPU) but only gave +0.5% end to end.
+- With DSpark the GPU is only ~18% of a verify step (CPU experts dominate, at the DRAM limit), so further GPU work mostly helps the no-draft path. Remaining GPU time per token (no draft, ~19 ms): FP8 matmuls ~8 ms, BF16 `output` head 1.2 ms (at bandwidth), ~2,100 small kernels 5.7 ms (rms_norm 1.0, flash attn 0.7, concat 0.5, ...), `attn_output_a` (mmf) 2.5 ms.
+- Possible next steps: bit-exact fusions of small kernels (~2-3 us each); the `attn_output_a` tensor-core path; merging this branch back into `perf/dsv4-flash-profile` and pushing.
 
 ## Goal
 

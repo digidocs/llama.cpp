@@ -11,7 +11,7 @@ Launch scripts (copies in `scripts/`), all 20 threads on cores 0-19, `GGML_OP_OF
 | script | model | context | ubatch | draft | server tg | pp (9K prompt) | VRAM |
 |---|---|---|---|---|---|---|---|
 | `~/ds4f.sh` | Q8_K_XL | 450K | 4096 | none | 15.8 t/s | 208 t/s | 23.0 GB |
-| `~/ds4f-dspark.sh` | Q8_K_XL | 350K | 4096 | DSpark Q8_0, n-max 1 | 18.0 t/s | 205 t/s | 22.8 GB |
+| `~/ds4f-dspark.sh` | Q8_K_XL | 350K | 4096 | DSpark Q8_0, n-max 3, p-min 0.7 | 18.33 t/s (18.04 with thinking) | 205 t/s | 22.5 GB |
 | `~/ds4f-q4.sh` | Q4_K_XL | 450K | 6144 | none | 18.0-18.55 t/s | 271 t/s | 20.7 GB |
 | **`~/ds4f-q4-dspark.sh`** | Q4_K_XL | 450K | 6144 | DSpark Q8_0, **n-max 3, p-min 0.7** | **19.86 t/s** | 267 t/s | 21.9 GB |
 
@@ -39,8 +39,25 @@ Draft settings (server, Q4_K_XL, 450K, ub 6144), before and after the fix:
 
 - The top configurations (n3/p0.7, n2, n2/p0.5, n1) are within about the +-0.4 t/s run-to-run noise; n3/p0.7 is the best measured, +9.8% over the controls.
 - DSpark is a block drafter (`block_size=5`): one draft pass per step, whatever n-max is. The cost of longer drafts is in verification: each extra verified token costs nearly a full set of CPU expert reads (tokens route to different experts), and only the ~15 ms GPU part is shared across the batch. Acceptance depends strongly on the prompt (the hardest test prompt had 59% at n-max 1).
-- The Q8_K_XL DSpark script still uses n-max 1 (17.81 t/s at 200K, 17.97 at 350K); the cutoff settings were not re-tested on Q8_K_XL.
+- Q8_K_XL at 350K, thinking off (5 prompts x 700 tokens): n-max 1 18.25 t/s (82.5%), n-max 3 / p-min 0.7 18.33 t/s (86.2%). On the hardest prompt (p3, prose) n3/p0.7 fell slightly below no draft (15.24 vs 15.49 t/s; n1 16.38).
 - No MTP head in this GGUF (no `mtp`/`nextn` tensors), so `draft-mtp` is not an option. The Q2K-Q4K draft was not tested.
+
+### Reasoning (thinking on), Q8_K_XL
+
+All the draft matrices above ran with `enable_thinking: false`. Same 5 prompts and seeds with `THINK=1 MAX_TOKENS=2000 SKIP_PP=1`, `ds4f-dspark.sh` settings (350K):
+
+| prompt | n-max 1: t/s | acceptance | n-max 3, p-min 0.7: t/s | acceptance |
+|---|---|---|---|---|
+| p0 ISO 8601 parser | 17.63 | 81% | **18.96** | 83% |
+| p1 B-tree | 17.45 | 76% | 17.56 | 79% |
+| p2 CRC32 | 17.84 | 79% | 18.12 | 82% |
+| p3 1929 crash (prose) | 16.39 | 70% | **16.53** | 83% |
+| p4 Rust refactor | **18.52** | 87% | 18.13 | 80% |
+| **total** | 17.74 (7,845 tok) | 80.0% | **18.04** (6,888 tok) | 81.2% |
+
+- Reasoning text drafts about as well as answers: n1 drops from 18.25 to 17.74 t/s, acceptance 82.5% -> 80.0%. Both settings stay well above no draft (15.8 t/s, not re-measured with thinking).
+- n3/p0.7 is ahead or tied in both modes, and with thinking on it does not fall below no draft on the prose prompt. `ds4f-dspark.sh` stays at n-max 3 / p-min 0.7.
+- The +0.3 t/s gap is inside the +-0.4 run-to-run noise. At temp 1.0 the two settings sample different text, so compare totals, not individual prompts.
 
 ### Speculative step cost breakdown
 
@@ -225,7 +242,7 @@ Verified: all 162 MXFP4 `MUL_MAT` / `MUL_MAT_ID` cases pass vs the CPU reference
   # mode: 0 full layer, 1 gate only (ggml), 2 down only, 3 gate only direct vec_dot loop (no ggml),
   #       4 direct loop with ggml-style 16-row blocking, 5 alternate ggml/direct each iteration
   ```
-- `spec_run.sh` + `spec_prompts.py` + `spec_pp.py`: server A/B for speculative decoding. `spec_pp.py` first runs a ~9K-token prompt twice (prompt cache off) to measure pp; set `PP_ONLY=1` to skip the decode prompts. Starts `llama-server` with the ds4f.sh settings plus whatever args you pass, records VRAM, runs 5 chat prompts x 700 tokens (temp 1.0, fixed seeds, thinking off), prints t/s and draft acceptance, then stops the server with SIGINT so it prints its memory summary.
+- `spec_run.sh` + `spec_prompts.py` + `spec_pp.py`: server A/B for speculative decoding. `spec_pp.py` first runs a ~9K-token prompt twice (prompt cache off) to measure pp; set `PP_ONLY=1` to skip the decode prompts. Starts `llama-server` with the ds4f.sh settings plus whatever args you pass, records VRAM, runs 5 chat prompts x 700 tokens (temp 1.0, fixed seeds, thinking off), prints t/s and draft acceptance, then stops the server with SIGINT so it prints its memory summary. `THINK=1` turns thinking on, `MAX_TOKENS=` changes the per-prompt budget, `SKIP_PP=1` skips the pp measurement.
   ```
   OUT=/tmp/spec perf-dsv4f/spec_run.sh base -c 450000 -lv 4
   OUT=/tmp/spec perf-dsv4f/spec_run.sh ds3 -c 200000 -lv 4 -md models/unsloth/DeepSeek-V4-Flash-0731-GGUF/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \

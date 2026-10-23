@@ -11,7 +11,7 @@ M=${MODEL:-models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q8_K_XL/DeepSeek-V4-Fla
 PID=$!
 until curl -sf localhost:8011/health >/dev/null; do sleep 3; kill -0 $PID 2>/dev/null || { echo "SERVER DIED"; tail -20 $S/server_$tag.log; exit 1; }; done
 echo "vram_mib=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)"
-python3 -I $HERE/spec_pp.py $tag
-[ -n "$PP_ONLY" ] || python3 -I $HERE/spec_prompts.py $tag
+[ -n "$SKIP_PP" ] || python3 -I $HERE/spec_pp.py $tag
+[ -n "$PP_ONLY" ] || THINK=$THINK MAX_TOKENS=$MAX_TOKENS python3 -I $HERE/spec_prompts.py $tag
 echo "vram_after_mib=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)"
 kill -INT $PID; wait $PID 2>/dev/null

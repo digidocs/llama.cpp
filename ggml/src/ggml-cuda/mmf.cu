@@ -100,6 +100,12 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
 
+    if (ggml_cuda_tensor_is_fp8(src0)) {
+        GGML_ASSERT(src0->type == GGML_TYPE_BF16 && !ids);
+        ids_info.fp8_scales = (const uint8_t *) src0->data + ggml_nelements(src0);
+        ids_info_ptr = &ids_info;
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;

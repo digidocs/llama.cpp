@@ -1,3 +1,7 @@
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include "fp8.cuh"
 
 // e4m3 byte for a BF16 value with unbiased exponent eu, 7-bit mantissa m and sign s under the scale 2^k; -1 if inexact
@@ -21,10 +25,8 @@ static int fp8_encode(const int eu, const int m, const int s, const int k) {
     return -1;
 }
 
-bool ggml_cuda_fp8_pack(const uint16_t * src, int64_t n, uint8_t * q, uint8_t * e) {
-    GGML_ASSERT(n % GGML_CUDA_FP8_BLOCK == 0);
-
-    for (int64_t ib = 0; ib < n/GGML_CUDA_FP8_BLOCK; ++ib) {
+static bool fp8_pack_blocks(const uint16_t * src, int64_t ib0, int64_t ib1, uint8_t * q, uint8_t * e) {
+    for (int64_t ib = ib0; ib < ib1; ++ib) {
         const uint16_t * x = src + ib*GGML_CUDA_FP8_BLOCK;
 
         int emax = INT_MIN;
@@ -78,6 +80,30 @@ bool ggml_cuda_fp8_pack(const uint16_t * src, int64_t n, uint8_t * q, uint8_t * 
         }
     }
     return true;
+}
+
+bool ggml_cuda_fp8_pack(const uint16_t * src, int64_t n, uint8_t * q, uint8_t * e) {
+    GGML_ASSERT(n % GGML_CUDA_FP8_BLOCK == 0);
+
+    // blocks are independent: split them over threads, a model has GBs of such weights
+    const int64_t nb        = n/GGML_CUDA_FP8_BLOCK;
+    const int     n_threads = (int) std::min<int64_t>(std::max(1u, std::thread::hardware_concurrency()), std::max<int64_t>(1, nb/4096));
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> threads;
+    for (int t = 1; t < n_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            if (!fp8_pack_blocks(src, nb*t/n_threads, nb*(t + 1)/n_threads, q, e)) {
+                ok = false;
+            }
+        });
+    }
+    if (!fp8_pack_blocks(src, 0, nb/n_threads, q, e)) {
+        ok = false;
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+    return ok;
 }
 
 void ggml_cuda_fp8_unpack(const uint8_t * q, const uint8_t * e, int64_t n, uint16_t * dst) {

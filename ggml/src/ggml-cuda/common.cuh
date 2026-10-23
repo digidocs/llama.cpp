@@ -1634,6 +1634,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // FP8 weights (see fp8.cuh): number of elements, the scales follow the values
+    int64_t fp8_n_x = 0;
+    int64_t fp8_n_gate = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

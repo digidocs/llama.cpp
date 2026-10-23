@@ -1028,6 +1028,11 @@ static bool ggml_backend_buffer_is_cuda_fp8(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_cuda_fp8_buffer_free_buffer;
 }
 
+bool ggml_cuda_tensor_is_fp8(const ggml_tensor * tensor) {
+    const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
+    return t->buffer != nullptr && ggml_backend_buffer_is_cuda_fp8(t->buffer);
+}
+
 static bool ggml_cuda_fp8_tensor_supported(const ggml_tensor * tensor) {
     return tensor->type == GGML_TYPE_BF16 && tensor->view_src == nullptr && ggml_is_contiguous(tensor) &&
         tensor->ne[0] % GGML_CUDA_FP8_BLOCK == 0;
@@ -2234,6 +2239,19 @@ static const ggml_tensor * ggml_cuda_fp8_as_bf16(ggml_backend_cuda_context & ctx
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // FP8 weights: native kernels where BF16 would use them, otherwise a BF16 copy for the unchanged path
+    if (ggml_cuda_tensor_is_fp8(src0) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !ggml_cuda_op_mul_mat_use_fwht(dst)) {
+        const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+        const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+        if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1])) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+        if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id =*/ false)) {
+            ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+            return;
+        }
+    }
     ggml_cuda_pool_alloc<nv_bfloat16> src0_fp8_buf;
     ggml_tensor src0_fp8_tmp;
     src0 = ggml_cuda_fp8_as_bf16(ctx, src0, src0_fp8_buf, src0_fp8_tmp);
@@ -4624,10 +4642,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                // FP8 weights run natively when up and gate are both FP8, otherwise as BF16 copies
                 ggml_cuda_pool_alloc<nv_bfloat16> fp8_buf, fp8_buf_gate;
                 ggml_tensor fp8_tmp, fp8_tmp_gate;
-                const ggml_tensor * src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
-                fusion_data.gate = ggml_cuda_fp8_as_bf16(*cuda_ctx, fusion_data.gate, fp8_buf_gate, fp8_tmp_gate);
+                const ggml_tensor * src0_mm = src0;
+                if (ids || ggml_cuda_tensor_is_fp8(src0) != ggml_cuda_tensor_is_fp8(fusion_data.gate)) {
+                    src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
+                    fusion_data.gate = ggml_cuda_fp8_as_bf16(*cuda_ctx, fusion_data.gate, fp8_buf_gate, fp8_tmp_gate);
+                }
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0_mm, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -4669,10 +4691,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                // FP8 weights run natively when up and gate are both FP8, otherwise as BF16 copies
                 ggml_cuda_pool_alloc<nv_bfloat16> fp8_buf, fp8_buf_gate;
                 ggml_tensor fp8_tmp, fp8_tmp_gate;
-                const ggml_tensor * src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
-                fusion_data.gate = ggml_cuda_fp8_as_bf16(*cuda_ctx, fusion_data.gate, fp8_buf_gate, fp8_tmp_gate);
+                const ggml_tensor * src0_mm = src0;
+                if (ids || ggml_cuda_tensor_is_fp8(src0) != ggml_cuda_tensor_is_fp8(fusion_data.gate)) {
+                    src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
+                    fusion_data.gate = ggml_cuda_fp8_as_bf16(*cuda_ctx, fusion_data.gate, fp8_buf_gate, fp8_tmp_gate);
+                }
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0_mm, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -4833,7 +4859,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_pool_alloc<nv_bfloat16> fp8_buf;
             ggml_tensor fp8_tmp;
-            const ggml_tensor * src0_mm = ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp);
+            const ggml_tensor * src0_mm = ids ? ggml_cuda_fp8_as_bf16(*cuda_ctx, src0, fp8_buf, fp8_tmp) : src0;
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0_mm, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;

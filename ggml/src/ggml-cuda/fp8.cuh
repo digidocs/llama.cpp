@@ -21,14 +21,20 @@ void ggml_cuda_fp8_unpack(const uint8_t * q, const uint8_t * e, int64_t n, uint1
 // expands the FP8 storage of a BF16 tensor with n elements to BF16 on the GPU
 void ggml_cuda_fp8_to_bf16(const void * fp8, int64_t n, nv_bfloat16 * dst, cudaStream_t stream);
 
-// exact value of an e4m3 byte times 2^(scale - 127)
-static __device__ __forceinline__ float ggml_cuda_fp8_e4m3_scaled(const uint8_t q, const uint8_t scale) {
-    const uint32_t sign = (uint32_t) (q & 0x80) << 24;
-    const int      ex   = (q >> 3) & 0x0F;
-    const uint32_t m    = q & 0x07;
-    if (ex == 0) {
-        // subnormal e4m3: m * 2^-9 * 2^(scale - 127), exact as a product of a small integer and a power of two
-        return __uint_as_float(sign | __float_as_uint((float) m * __uint_as_float((uint32_t) (scale - 9) << 23)));
-    }
-    return __uint_as_float(sign | ((uint32_t) (ex - 7 + scale) << 23) | (m << 20));
+// marks FP8 storage as the weight type of a kernel template; pointer arithmetic is per element (one byte)
+struct ggml_cuda_fp8_t {
+    uint8_t q;
+};
+
+// true if the tensor is a BF16 weight held in a CUDA FP8 buffer
+bool ggml_cuda_tensor_is_fp8(const ggml_tensor * tensor);
+
+// exact value of an e4m3 byte times 2^(scale - 127): an integer mantissa times a power of two, both normal floats
+// (no subnormals, which -use_fast_math would flush) and no branches
+static __device__ __forceinline__ float ggml_cuda_fp8_e4m3_scaled(const uint32_t q, const uint32_t scale) {
+    const uint32_t ex = (q >> 3) & 0x0F;
+    const uint32_t m  = q & 0x07;
+    const float    mi = (float) (ex ? (8 | m) : m);
+    const float    p2 = __uint_as_float(((ex ? ex : 1) + scale - 10) << 23);
+    return __uint_as_float(__float_as_uint(mi*p2) | ((q & 0x80) << 24));
 }

@@ -4,6 +4,7 @@
 #include "mmvf.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
+#include "fp8.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -45,7 +46,8 @@ static __global__ void mul_mat_vec_f(
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
-    x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
+    const int64_t x_offset = int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + row*stride_row;
+    x   += x_offset;
     y   += int64_t(sample_y)  *stride_sample_y   + channel_y  *stride_channel_y;
     dst += int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
     if constexpr (is_multi_token_id) {
@@ -301,6 +303,47 @@ static __global__ void mul_mat_vec_f(
             }
         }
 #endif
+    } else if constexpr (std::is_same_v<T, ggml_cuda_fp8_t>) {
+        // same per-thread order as BF16: each weight decodes to the float its BF16 value converts to
+        const uint16_t * x2       = (const uint16_t *) x;
+        const uint8_t  * x_scales = (const uint8_t *) x_ptr + fusion.fp8_n_x + x_offset/GGML_CUDA_FP8_BLOCK;
+        [[maybe_unused]] const uint16_t * gate_x2       = nullptr;
+        [[maybe_unused]] const uint8_t  * gate_x_scales = nullptr;
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                gate_x2       = (const uint16_t *) gate_x;
+                gate_x_scales = (const uint8_t *) fusion.gate + fusion.fp8_n_gate + x_offset/GGML_CUDA_FP8_BLOCK;
+            }
+        }
+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            const uint32_t q  = x2[col2];
+            const uint32_t sc = x_scales[col2/(GGML_CUDA_FP8_BLOCK/2)];
+            const float tmpx0 = ggml_cuda_fp8_e4m3_scaled(q & 0xFF, sc);
+            const float tmpx1 = ggml_cuda_fp8_e4m3_scaled(q >> 8,   sc);
+            [[maybe_unused]] float tmpx0_gate = 0.0f;
+            [[maybe_unused]] float tmpx1_gate = 0.0f;
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    const uint32_t qg  = gate_x2[col2];
+                    const uint32_t scg = gate_x_scales[col2/(GGML_CUDA_FP8_BLOCK/2)];
+                    tmpx0_gate = ggml_cuda_fp8_e4m3_scaled(qg & 0xFF, scg);
+                    tmpx1_gate = ggml_cuda_fp8_e4m3_scaled(qg >> 8,   scg);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
+                ggml_cuda_mad(sumf[j], tmpx1, tmpy.y);
+
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        ggml_cuda_mad(sumf_gate[j], tmpx0_gate, tmpy.x);
+                        ggml_cuda_mad(sumf_gate[j], tmpx1_gate, tmpy.y);
+                    }
+                }
+            }
+        }
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
@@ -717,6 +760,18 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
                 ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
+            if (ggml_cuda_tensor_is_fp8(src0)) {
+                GGML_ASSERT(!ids);
+                GGML_ASSERT(!fusion || !fusion->gate || ggml_cuda_tensor_is_fp8(fusion->gate));
+                fusion_local.fp8_n_x    = ggml_nelements(src0);
+                fusion_local.fp8_n_gate = fusion && fusion->gate ? ggml_nelements(fusion->gate) : 0;
+                const ggml_cuda_fp8_t * src0_d = (const ggml_cuda_fp8_t *) src0->data;
+                mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
+                    ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+                    ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
+                break;
+            }
+            GGML_ASSERT(!fusion || !fusion->gate || !ggml_cuda_tensor_is_fp8(fusion->gate));
             const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,

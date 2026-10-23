@@ -1,5 +1,7 @@
 #pragma once
 
+#include "fp8.cuh"
+
 #include "mma.cuh"
 #include "common.cuh"
 #include "convert.cuh"
@@ -39,13 +41,16 @@ struct mmf_ids_data {
     const int32_t * expert_bounds_dev = nullptr;
     int n_experts = 0;
     int sis1 = 0;
+    // MUL_MAT with a BF16 weight in FP8 storage (see fp8.cuh): its scales, which follow its values
+    const uint8_t * fp8_scales = nullptr;
 };
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
-template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids>
+// x_fp8: x holds the e4m3 bytes of a BF16 weight in FP8 storage and ids points to its scales (no ids in this case)
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, bool x_fp8 = false>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
 static __global__ void mul_mat_f(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
@@ -110,7 +115,9 @@ static __global__ void mul_mat_f(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-    x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row ;
+    [[maybe_unused]] const uint16_t * x_q = (const uint16_t *) x;
+    const int64_t x_offset = int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + row0*stride_row;
+    x   += x_offset;
     y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : channel_y  *stride_channel_y);
     dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : channel_dst*stride_channel_dst);
 
@@ -175,7 +182,18 @@ static __global__ void mul_mat_f(
             ggml_cuda_syncwarp();
 #pragma unroll
             for (int i = 0; i < tile_A::I; ++i) {
-                tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
+                if constexpr (x_fp8 && std::is_same_v<T, nv_bfloat162>) {
+                    // decode to the BF16 pair the weight holds, so the MMA inputs are the same
+                    const int64_t  ip = x_offset + (itA*tile_A::I + i)*stride_row + col;
+                    const uint32_t q  = x_q[ip];
+                    const uint32_t sc = ((const uint8_t *) ids)[ip/(GGML_CUDA_FP8_BLOCK/2)];
+                    nv_bfloat162 v;
+                    v.x = __ushort_as_bfloat16((unsigned short) (__float_as_uint(ggml_cuda_fp8_e4m3_scaled(q & 0xFF, sc)) >> 16));
+                    v.y = __ushort_as_bfloat16((unsigned short) (__float_as_uint(ggml_cuda_fp8_e4m3_scaled(q >> 8,   sc)) >> 16));
+                    tile_xy[i*tile_k_padded + threadIdx.x] = v;
+                } else {
+                    tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row  + col];
+                }
             }
             ggml_cuda_syncwarp();
 #pragma unroll
@@ -627,6 +645,15 @@ static inline void mul_mat_f_switch_ids(
             (x, y, ids, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
              stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
              sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else if (ids_data && ids_data->fp8_scales) {
+        if constexpr (std::is_same_v<T, nv_bfloat162>) {
+            mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false, true><<<block_nums, block_dims, nbytes_shared_total, stream>>>
+                (x, y, (const int32_t *) ids_data->fp8_scales, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
+                 stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+        } else {
+            GGML_ABORT("FP8 storage is only supported for BF16 weights");
+        }
     } else {
         mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>
             (x, y, ids, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,

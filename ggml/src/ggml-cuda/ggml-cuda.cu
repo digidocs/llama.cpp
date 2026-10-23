@@ -91,7 +91,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -1315,13 +1321,86 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+// large pinned buffers are allocated with mmap, faulted in by several threads with huge pages where available, and
+// then registered with CUDA: a single cudaMallocHost zeroes and pins every 4 KiB page on one thread, which for a
+// buffer of ~140 GB holding CPU experts takes ~40 s
+#define GGML_CUDA_HOST_REGISTER_MIN_SIZE (1024ull*1024*1024)
+
+static std::mutex ggml_cuda_host_registered_mutex;
+static std::unordered_map<void *, size_t> ggml_cuda_host_registered;
+
+static void * ggml_cuda_host_malloc_registered(size_t size) {
+#ifdef __linux__
+    void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        return nullptr;
+    }
+    madvise(ptr, size, MADV_HUGEPAGE);
+
+    const size_t page     = 2ull*1024*1024;
+    const int    n_threads = (int) std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+    const size_t chunk    = ((size + n_threads - 1)/n_threads + page - 1)/page*page;
+    std::vector<std::thread> threads;
+    for (int t = 0; t < n_threads; ++t) {
+        threads.emplace_back([=]() {
+            char * p = (char *) ptr;
+            for (size_t off = t*chunk; off < std::min(size, (t + 1)*chunk); off += 4096) {
+                p[off] = 0;
+            }
+        });
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_DEBUG("%s: cudaHostRegister of %.2f MiB failed: %s\n", __func__, size/1024.0/1024.0, cudaGetErrorString(err));
+        munmap(ptr, size);
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_registered_mutex);
+    ggml_cuda_host_registered[ptr] = size;
+    return ptr;
+#else
+    GGML_UNUSED(size);
+    return nullptr;
+#endif
+}
+
+static void ggml_cuda_host_free(void * ptr) {
+#ifdef __linux__
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_host_registered_mutex);
+        auto it = ggml_cuda_host_registered.find(ptr);
+        if (it != ggml_cuda_host_registered.end()) {
+            CUDA_CHECK(cudaHostUnregister(ptr));
+            munmap(ptr, it->second);
+            ggml_cuda_host_registered.erase(it);
+            return;
+        }
+    }
+#endif
+    CUDA_CHECK(cudaFreeHost(ptr));
+}
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    CUDA_CHECK(cudaFreeHost(buffer->context));
+    ggml_cuda_host_free(buffer->context);
 }
 
 static void * ggml_cuda_host_malloc(size_t size) {
     if (ggml_cuda_pinned_memory_disabled()) {
         return nullptr;
+    }
+
+    static const bool no_register = ggml_cuda_env_flag("GGML_CUDA_NO_HOST_REGISTER");
+    if (size >= GGML_CUDA_HOST_REGISTER_MIN_SIZE && !no_register) {
+        void * ptr = ggml_cuda_host_malloc_registered(size);
+        if (ptr) {
+            return ptr;
+        }
     }
 
     void * ptr = nullptr;

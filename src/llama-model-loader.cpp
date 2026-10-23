@@ -11,8 +11,12 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <atomic>
+#include <chrono>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
 #include <unordered_set>
 
 static const size_t kiB = 1024;
@@ -580,6 +584,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -648,6 +653,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -699,6 +705,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_paths.emplace_back();
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1690,15 +1697,96 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // without mmap, tensors in host buffers are read by several threads, each with its own file handles, while this
+    // thread stages the device tensors: a single reader leaves most of the bandwidth of an NVMe drive unused
+    std::vector<ggml_tensor *> host_tensors;
+    std::unordered_set<const ggml_tensor *> host_loaded;
+    std::vector<std::thread> readers;
+    std::atomic<size_t> host_next{0};
+    std::atomic<size_t> host_bytes_done{0};
+    std::atomic<bool> readers_abort{false};
+    std::exception_ptr reader_error;
+    std::mutex reader_error_mutex;
+
+    int n_readers = 8;
+    if (const char * env = getenv("LLAMA_LOAD_THREADS")) {
+        n_readers = std::max(1, atoi(env));
+    }
+    const bool parallel_host = !use_mmap && n_readers > 1 &&
+        std::none_of(file_paths.begin(), file_paths.end(), [](const std::string & path) { return path.empty(); });
+    if (parallel_host) {
+        for (ggml_tensor * cur : tensors) {
+            if (cur->data && cur->buffer && ggml_backend_buffer_is_host(cur->buffer) && !lazy.has(cur) && get_weight(ggml_get_name(cur))) {
+                host_tensors.push_back(cur);
+                host_loaded.insert(cur);
+            }
+        }
+        // in file order, so the readers move through each file roughly sequentially
+        std::sort(host_tensors.begin(), host_tensors.end(), [&](const ggml_tensor * a, const ggml_tensor * b) {
+            const auto * wa = get_weight(ggml_get_name(a));
+            const auto * wb = get_weight(ggml_get_name(b));
+            return wa->idx != wb->idx ? wa->idx < wb->idx : wa->offs < wb->offs;
+        });
+        for (int t = 0; t < n_readers && !host_tensors.empty(); ++t) {
+            readers.emplace_back([&]() {
+                try {
+                    std::vector<std::unique_ptr<llama_file>> own(files.size());
+                    for (size_t i; !readers_abort && (i = host_next++) < host_tensors.size(); ) {
+                        ggml_tensor * cur = host_tensors[i];
+                        const auto * weight = get_weight(ggml_get_name(cur));
+                        auto & file = own.at(weight->idx);
+                        if (!file) {
+                            file.reset(new llama_file(file_paths.at(weight->idx).c_str(), "rb", use_direct_io));
+                        }
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(cur->data, ggml_nbytes(cur));
+                        host_bytes_done += ggml_nbytes(cur);
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(reader_error_mutex);
+                    if (!reader_error) {
+                        reader_error = std::current_exception();
+                    }
+                    readers_abort = true;
+                }
+            });
+        }
+    }
+    const auto join_readers = [&]() {
+        for (auto & reader : readers) {
+            reader.join();
+        }
+        readers.clear();
+        if (reader_error) {
+            std::rethrow_exception(reader_error);
+        }
+    };
+    // if the loop below throws, stop and join the readers before their state goes out of scope
+    struct readers_stopper {
+        std::vector<std::thread> & readers;
+        std::atomic<bool> & abort;
+        ~readers_stopper() {
+            abort = true;
+            for (auto & reader : readers) {
+                reader.join();
+            }
+        }
+    } stopper{readers, readers_abort};
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
         }
+        if (host_loaded.count(cur)) {
+            continue;
+        }
 
         if (progress_callback) {
-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            if (!progress_callback((float) (size_done + host_bytes_done) / size_data, progress_callback_user_data)) {
+                readers_abort = true;
+                join_readers();
                 return false;
             }
         }
@@ -1822,6 +1910,25 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    // wait for the host readers, reporting progress meanwhile
+    while (host_next < host_tensors.size() && !readers_abort) {
+        if (progress_callback && !progress_callback((float) (size_done + host_bytes_done) / size_data, progress_callback_user_data)) {
+            readers_abort = true;
+            join_readers();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    join_readers();
+    size_done += host_bytes_done;
+    if (check_tensors) {
+        for (ggml_tensor * cur : host_tensors) {
+            validation_result.emplace_back(std::async(std::launch::async, [cur] {
+                return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur)));
+            }));
+        }
     }
 
     // free temporary resources used for async uploads

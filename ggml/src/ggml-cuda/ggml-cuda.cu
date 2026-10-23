@@ -2883,17 +2883,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    // the first node plus a hash of the node count and the shapes of the first nodes: a graph whose shape alternates
-    // (e.g. the verify batch of speculative decoding with a variable draft length) keeps one CUDA graph per shape
-    // instead of falling back to eager execution and recapturing on every change. Replays are still guarded by the
-    // full node property check in ggml_cuda_graph_update_required, so a hash collision only costs a recapture.
+    // the first node plus a hash of the node count and the shape of the first node: a graph whose batch size alternates
+    // (e.g. the verify batch of speculative decoding with a variable draft length) keeps one CUDA graph per batch size,
+    // while shapes that only grow with the context update that graph instead of creating new ones. Replays are still
+    // guarded by the full node property check in ggml_cuda_graph_update_required, so a collision only costs an update.
     uint64_t h = (uint64_t) (uintptr_t) cgraph->nodes[0];
     h = (h ^ (uint64_t) cgraph->n_nodes) * 0x100000001B3ull;
-    const int n_hash = std::min(cgraph->n_nodes, 16);
-    for (int i = 0; i < n_hash; ++i) {
-        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            h = (h ^ (uint64_t) cgraph->nodes[i]->ne[d]) * 0x100000001B3ull;
-        }
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        h = (h ^ (uint64_t) cgraph->nodes[0]->ne[d]) * 0x100000001B3ull;
     }
     return (const void *) (uintptr_t) h;
 }
@@ -5046,11 +5043,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    if (ggml_cuda_graph_debug_enabled()) {
-                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
-                    }
+                    // a graph that was stable before: capture again right away and update the executable in place
+                    use_cuda_graph = true;
+                    cuda_graph_update_required = true;
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instances.empty();

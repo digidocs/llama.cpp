@@ -10,12 +10,12 @@ Launch scripts (copies in `scripts/`), all 20 threads on cores 0-19, `GGML_OP_OF
 
 | script | model | context | ubatch | draft | server tg | pp (9K prompt) | VRAM |
 |---|---|---|---|---|---|---|---|
-| `~/ds4f.sh` | Q8_K_XL | 450K | 4096 | none | **17.27 t/s** (was 16.1) | 208.8 t/s | 23.0 GB |
-| `~/ds4f-dspark.sh` | Q8_K_XL | 350K | 4096 | DSpark Q8_0, n-max 3, p-min 0.7 | **19.65 t/s** (same-build old path 18.94) | 205 t/s | 22.5 GB |
-| `~/ds4f-q4.sh` | Q4_K_XL | 450K | 6144 | none | 18.0-18.55 t/s | 271 t/s | 20.7 GB |
-| **`~/ds4f-q4-dspark.sh`** | Q4_K_XL | 450K | 6144 | DSpark Q8_0, **n-max 3, p-min 0.7** | **19.86 t/s** (before the changes below) | 267 t/s | 21.9 GB |
+| **`~/ds4f.sh`** | Q8_K_XL, FP8 dense | 450K | 4096 | none | **18.59-18.68 t/s** (was 17.27) | 208.2 t/s | ~18 GB |
+| **`~/ds4f-dspark.sh`** | Q8_K_XL, FP8 dense | **450K** (was 350K) | 4096 | DSpark Q8_0, n-max 3, p-min 0.7 | **20.23 t/s** (was 19.65 at 350K) | 205 t/s | ~19 GB |
+| `~/ds4f-q4.sh` | Q4_K_XL | 450K | 6144 | none | 19.25 t/s | 271.6 t/s | 20.7 GB |
+| `~/ds4f-q4-dspark.sh` | Q4_K_XL | 450K | 6144 | DSpark Q8_0, n-max 3, p-min 0.7 | 20.91 t/s | 267 t/s | 21.9 GB |
 
-The Q4_K_XL rows have not been re-measured after the CUDA graph, overlap and loader changes below (one 600-token Q4 + DSpark request: 23.63 t/s, byte-identical output). Model load (Q8_K_XL) is ~76 s to ready, was ~162 s.
+"FP8 dense" (branch `feat/fp8-dense`, see `FP8-HANDOFF.md`): the dense weights DeepSeek ships in FP8 (stored as exact BF16 in the GGUF) are kept in VRAM as FP8 with `-ot ...=CUDA0_FP8`, with output byte-identical to BF16. Q8_K_XL is lossless; Q4_K_XL's dense weights are lossy Q8_0, so Q8_K_XL + FP8 is now the better choice, within ~3% of Q4_K_XL's speed. Model load (Q8_K_XL) is ~82 s to ready, was ~162 s before the loader changes.
 
 ### CUDA graph re-recording, CPU/GPU overlap, faster loading
 

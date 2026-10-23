@@ -23,6 +23,32 @@ All output byte-identical to the previous build (md5 of every reply; Q4 + DSpark
 - Most frequent op pairs still run as separate kernels (decode, per token, after existing fusions): RMS_NORM(+MUL) -> ROPE 178 (`kv`, `q`, `csa/hca/lid_state_compress`), RMS_NORM(+MUL) -> MUL_MAT 130, GET_ROWS -> SET_ROWS 125 (the compressor state persist copies; source and destination are the same state cache, so a one-kernel copy is unsafe and the fusion memory check would refuse it), ADD -> CONCAT 83. A norm -> rope fusion would save ~0.3 ms/token but must reproduce each rope variant bit for bit.
 - Possible next steps: the norm -> rope fusion; the `attn_output_a` tensor-core path; merging this branch back into `perf/dsv4-flash-profile` and pushing.
 
+## Is it bit-exact?
+
+Yes, by construction, and by every test run so far. The tests compare the generated text (md5), not the logits.
+
+**By construction**
+- **Weights.** Only tensors whose every value is exactly an e4m3 number times a power-of-two scale per 32 values are stored as FP8. The scan found this all-or-nothing per tensor kind: every block of the 9 FP8-origin kinds passes, every block of the true-BF16 kinds fails. `set_tensor` checks every block on every load and aborts the load if any value is not exact, so each stored weight decodes to exactly its BF16 value.
+- **Decode.** Byte permute, masks and shifts, an FP16 -> FP32 conversion and a multiply by a power of two, none of which round. No float subnormals are produced, which matters because the build uses `-use_fast_math` (flush to zero).
+- **Kernels.** Each FP8 kernel performs the same floating-point operations in the same order as the BF16 kernel it replaces.
+  - `mul_mat_vec_f` (FP8): the same per-thread loop and reductions as BF16.
+  - `mul_mat_vec_f_vt`: reproduces the 256-thread kernel's per-thread partial sums and its warp and second-stage butterfly reductions.
+  - `mul_mat_f` (FP8): feeds the same BF16 pairs into the same MMA sequence.
+  - Paths without an FP8 kernel (cuBLAS for batches over 16 columns): expand to BF16 and run unchanged code.
+- **Graph head/tail split.** Same kernels, same order, same stream; only the submission is split, at an op boundary, so the fusion decisions are unchanged.
+
+**Tested (md5 of every reply equal to the previous build)**
+- Q8 no draft: 5 prompts x 700 tokens (several runs), plus many 300-token runs during development.
+- Q8 + DSpark at 450K: 5 prompts x 700 tokens, identical draft counts (1860/2157).
+- Q4 + DSpark: the 600-token reference `349af7bedf9c`.
+- BF16 weights through `mul_mat_vec_f_vt`.
+
+Sampling is at temperature 1.0, so a change in any logit would almost always change a token within a few hundred tokens.
+
+**Not yet tested**
+- `kld_check.sh` (logit-level comparison). It would also cover large-batch prompt processing directly; that path runs unchanged BF16 code after expansion.
+- Prompts far beyond 9K tokens; none of the changed kernels depends on context length.
+
 ## Goal
 
 Store the dense weights that DeepSeek shipped as FP8 in 8 bits in VRAM instead of the 16-bit BF16 the GGUF holds them in. That halves the bytes the GPU reads per token for those weights and frees VRAM, with **bit-identical output**.

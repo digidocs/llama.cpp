@@ -1078,6 +1078,10 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // when set, build_moe_ffn adds this tensor to the graph after the expert selection and before the expert matmuls,
+    // so GPU work that is independent of the experts (e.g. a shared expert) can overlap with experts running on the CPU
+    mutable ggml_tensor * moe_pre_experts = nullptr;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

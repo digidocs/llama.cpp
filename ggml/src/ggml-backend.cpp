@@ -921,6 +921,8 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
+    // nodes to compute before the early copy of the next split's inputs, -1 if none, -2 if not computed yet
+    int n_early_copy;
 };
 
 struct ggml_backend_sched {
@@ -957,6 +959,11 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+
+    // early copy of the inputs of a following CPU split, so the rest of the current split overlaps with it
+    bool early_copy;
+    ggml_backend_event_t early_copy_events[GGML_SCHED_MAX_BACKENDS];
+
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1622,6 +1629,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
+        split->n_early_copy = -2;
 
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
     }
@@ -1862,11 +1870,103 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// When the next split runs on the CPU and takes inputs computed by this split, the nodes of this split after the last
+// of those inputs do not feed the CPU split. Returns the number of nodes to compute before copying the inputs early, so
+// the remaining nodes run on this backend while the CPU split computes, or -1 if that does not apply.
+static int ggml_backend_sched_early_copy_nodes(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, const struct ggml_backend_sched_split * next) {
+    if (!sched->early_copy || sched->callback_eval || sched->early_copy_events[split->backend_id] == NULL ||
+        next->backend_id != sched->n_backends - 1 || split->backend_id == next->backend_id) {
+        return -1;
+    }
+
+    int n_early = 0;
+    int n_copy  = 0;
+    for (int i = 0; i < next->n_inputs; i++) {
+        struct ggml_tensor * input = next->inputs[i];
+        if (ggml_backend_sched_get_tensor_backend(sched, input) != sched->backends[split->backend_id]) {
+            continue;
+        }
+        if ((input->flags & GGML_TENSOR_FLAG_INPUT) || ggml_backend_sched_is_host_weight(input)) {
+            return -1;
+        }
+        // a view (e.g. a reshape) computes nothing: its data is ready once the tensor that owns the memory is computed
+        const struct ggml_tensor * base = input->view_src ? input->view_src : input;
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            if (split->graph.nodes[j] == base) {
+                n_early = std::max(n_early, j + 1);
+            }
+        }
+        n_copy++;
+    }
+    if (n_copy == 0) {
+        return -1;
+    }
+
+    // a node that reads an early node other than the copied inputs also stays early, so chains of ops that the backend
+    // may fuse (e.g. expert selection and weights) are not cut in two
+    const auto is_early_node = [&](const struct ggml_tensor * t, int n) {
+        for (int j = 0; j < n; j++) {
+            if (split->graph.nodes[j] == t) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto is_copied = [&](const struct ggml_tensor * t) {
+        for (int i = 0; i < next->n_inputs; i++) {
+            const struct ggml_tensor * input = next->inputs[i];
+            if (t == (input->view_src ? input->view_src : input)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (n_early < split->graph.n_nodes) {
+        const struct ggml_tensor * node = split->graph.nodes[n_early];
+        // views (e.g. the top-k view of an argsort) are part of the chain even when they view a copied input
+        const bool is_view = ggml_op_is_empty(node->op);
+        bool reads_early = false;
+        for (int k = 0; k < GGML_MAX_SRC && !reads_early; k++) {
+            const struct ggml_tensor * src = node->src[k];
+            reads_early = src && (is_view || !is_copied(src)) && is_early_node(src, n_early);
+        }
+        if (!reads_early) {
+            break;
+        }
+        n_early++;
+    }
+    if (n_early >= split->graph.n_nodes) {
+        return -1;
+    }
+
+    // the late nodes must not write to the memory of the copied inputs
+    for (int j = n_early; j < split->graph.n_nodes; j++) {
+        const struct ggml_tensor * node = split->graph.nodes[j];
+        if (ggml_op_is_empty(node->op)) {
+            continue;
+        }
+        const struct ggml_tensor * node_base = node->view_src ? node->view_src : node;
+        for (int i = 0; i < next->n_inputs; i++) {
+            const struct ggml_tensor * input = next->inputs[i];
+            if (node_base == (input->view_src ? input->view_src : input)) {
+                return -1;
+            }
+        }
+    }
+
+    return n_early;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
+
+    // inputs of the current split that were already copied by the previous split, and the event to wait for
+    std::vector<bool> early_copied;
+    std::vector<bool> next_early_copied;
+    ggml_backend_event_t early_event = NULL;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1886,6 +1986,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (early_event && early_copied[input_id]) {
+                continue;
+            }
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
@@ -1896,7 +1999,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval) {
+        if (early_event) {
+            ggml_backend_event_synchronize(early_event);
+            early_event = NULL;
+        }
+
+        const struct ggml_backend_sched_split * next = split_id + 1 < sched->n_splits ? &splits[split_id + 1] : NULL;
+        if (split->n_early_copy == -2) {
+            split->n_early_copy = next ? ggml_backend_sched_early_copy_nodes(sched, split, next) : -1;
+        }
+        const int n_early = split->n_early_copy;
+
+        if (n_early >= 0) {
+            // compute the nodes the next (CPU) split needs, copy its inputs, then compute the rest of this split
+            if (n_early > 0) {
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, 0, n_early);
+                gv.uid = split->graph.uid; // same split, same nodes: lets the backend skip its graph checks
+                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            }
+
+            next_early_copied.assign(next->n_inputs, false);
+            for (int input_id = 0; input_id < next->n_inputs; input_id++) {
+                struct ggml_tensor * input = next->inputs[input_id];
+                if (ggml_backend_sched_get_tensor_backend(sched, input) == split_backend) {
+                    struct ggml_tensor * input_cpy = tensor_copy(input, next->backend_id, sched->cur_copy);
+                    ggml_backend_tensor_get_async(split_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                    next_early_copied[input_id] = true;
+                }
+            }
+            early_event = sched->early_copy_events[split_backend_id];
+            ggml_backend_event_record(early_event, split_backend);
+
+            struct ggml_cgraph gv = ggml_graph_view(&split->graph, n_early, split->graph.n_nodes);
+            gv.uid = split->graph.uid;
+            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+            early_copied.swap(next_early_copied);
+        } else if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
@@ -2010,6 +2154,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    const char * GGML_SCHED_NO_EARLY_COPY = getenv("GGML_SCHED_NO_EARLY_COPY");
+    sched->early_copy = sched->n_copies == 1 && !(GGML_SCHED_NO_EARLY_COPY && atoi(GGML_SCHED_NO_EARLY_COPY));
+    if (sched->early_copy) {
+        for (int b = 0; b < n_backends - 1; b++) {
+            sched->early_copy_events[b] = ggml_backend_event_new(backends[b]->device);
+        }
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
@@ -2026,6 +2178,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        ggml_backend_event_free(sched->early_copy_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);

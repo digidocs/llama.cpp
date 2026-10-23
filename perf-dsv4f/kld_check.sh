@@ -3,7 +3,7 @@
 # usage: kld_check.sh base <out.kld>              save reference logits (EXTRA="..." adds arguments, e.g. -ot)
 #        kld_check.sh cmp  <ref.kld> [label]       compare the current build/env against a reference
 cd ~/llama.cpp
-M=${MODEL:-$HOME/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf}
+M=${MODEL:-$HOME/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf}
 ARGS="-m $M -f perf-dsv4f/kld_text.txt -c 512 -b 512 -ub ${UB:-1} --chunks 2 -ngl 999 -ncmoe 999 -fa on -t 20 -C 0xFFFFF --cpu-strict 1 -lm ${LOAD_MODE:-none} ${EXTRA}"
 if [ "$1" = base ]; then
     ./build/bin/llama-perplexity $ARGS --kl-divergence-base "$2" 2>&1 | grep -aE "Final estimate|error" | tail -2

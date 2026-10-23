@@ -14,6 +14,8 @@ All output byte-identical to the previous build (md5 of every reply; Q4 + DSpark
 | dense weights in VRAM | 13.0 GB | 7.6 GB (~19 GB used with DSpark at 450K) |
 | load to ready | ~76 s | ~82 s |
 
+- llama-bench, original command (pp4096 / tg128, Q8_K_XL, 20 threads): master at the start 284.2 / 11.04 (16 threads); now BF16 dense 284.80 / 17.56, FP8 dense 283.79 / 18.69. 22 and 24 threads are within noise of 20.
+- The Q4_K_XL model and its `~` runners were deleted (2026-10-24); `kld_check.sh` now defaults to Q8_K_XL.
 - `~/ds4f.sh` and `~/ds4f-dspark.sh` use the FP8 storage (`-ot ...=CUDA0_FP8`); the DSpark script is now at 450K. Backups: `~/old-scripts/*.pre-fp8`.
 - Q8_K_XL + FP8 now reads about the same dense bytes as Q4_K_XL (whose dense weights are lossy Q8_0) and is within ~3% of its speed (Q4: 19.25 no draft, 20.91 DSpark), losslessly. The rest of the gap is mostly tensors that are true BF16 in Q8 (`output` head 1.0 GB vs 0.5 GB Q8_0), which cannot be stored exactly in 8 bits.
 - Commits on `feat/fp8-dense` (not pushed): FP8 buffer type + BF16 expansion path (`3d610ed49`), native FP8 in mmvf/mmf (`18d0034f5`), fast exact decode + one-warp-per-row kernel (`8e4eb969f`), two rows per warp (`09dba3342`), head/tail graph capture (`3a7caae37`).

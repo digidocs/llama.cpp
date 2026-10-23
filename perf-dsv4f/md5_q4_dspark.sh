@@ -1,6 +1,7 @@
 #!/bin/bash
 # usage: TAG=name [WHYENV=VAR=1] md5_q4_dspark.sh [extra server args]; logs to ~/dsv4f-work/<TAG>.log
 # one 600-token request with Q4_K_XL + DSpark n3/p0.7, prints t/s, draft counts and md5 of the reply (reference 349af7bedf9c)
+# NOTE: the Q4_K_XL model was deleted on 2026-10-24; use md5_q8.sh / md5_q8_dspark.sh
 cd ~
 export GGML_OP_OFFLOAD_MIN_BATCH=768 ${WHYENV:-MD5_TEST=1}
 L=~/dsv4f-work/${TAG:-why}.log; : > $L

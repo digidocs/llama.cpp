@@ -1,4 +1,4 @@
-import json, os, sys, urllib.request
+import hashlib, json, os, sys, urllib.request
 prompts = [
   "Write a Python function that parses an ISO 8601 duration string like 'P3DT4H12M' into total seconds, with tests.",
   "Explain how a B-tree insertion works, step by step, including node splits.",
@@ -9,7 +9,7 @@ prompts = [
 tag = sys.argv[1]
 # THINK=1 enables reasoning, MAX_TOKENS overrides the per-prompt token budget
 think = os.environ.get("THINK") == "1"
-max_tokens = int(os.environ.get("MAX_TOKENS", 700))
+max_tokens = int(os.environ.get("MAX_TOKENS") or 700)
 tot_n = tot_t = dn = da = 0
 for i, p in enumerate(prompts):
     body = {"messages": [{"role": "user", "content": p}], "max_tokens": max_tokens, "seed": 1000 + i,
@@ -20,5 +20,6 @@ for i, p in enumerate(prompts):
     n, ms = t.get("predicted_n", 0), t.get("predicted_ms", 0)
     tot_n += n; tot_t += ms
     dn += t.get("draft_n", 0) or 0; da += t.get("draft_n_accepted", 0) or 0
-    print(f"{tag} p{i}: {n} tok, {n/ms*1000 if ms else 0:.2f} t/s, draft {t.get('draft_n',0)}/{t.get('draft_n_accepted',0)} acc, pp {t.get('prompt_per_second',0):.0f} t/s", flush=True)
+    md5 = hashlib.md5(r["choices"][0]["message"]["content"].encode()).hexdigest()[:12]
+    print(f"{tag} p{i}: {n} tok, {n/ms*1000 if ms else 0:.2f} t/s, draft {t.get('draft_n',0)}/{t.get('draft_n_accepted',0)} acc, pp {t.get('prompt_per_second',0):.0f} t/s, md5 {md5}", flush=True)
 print(f"{tag} TOTAL: {tot_n} tok, {tot_n/tot_t*1000:.2f} t/s" + (f", acceptance {da/dn:.2%} ({da}/{dn})" if dn else ""), flush=True)

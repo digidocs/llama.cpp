@@ -12,10 +12,20 @@ Launch scripts (copies in `scripts/`), all 20 threads on cores 0-19, `GGML_OP_OF
 |---|---|---|---|---|---|---|---|
 | **`~/ds4f.sh`** | Q8_K_XL, FP8 dense | 450K | 4096 | none | **18.59-18.68 t/s** (was 17.27) | 208.2 t/s | ~18 GB |
 | **`~/ds4f-dspark.sh`** | Q8_K_XL, FP8 dense | **450K** (was 350K) | 4096 | DSpark Q8_0, n-max 3, p-min 0.7 | **20.23 t/s** (was 19.65 at 350K) | 205 t/s | ~19 GB |
-| `~/ds4f-q4.sh` | Q4_K_XL | 450K | 6144 | none | 19.25 t/s | 271.6 t/s | 20.7 GB |
-| `~/ds4f-q4-dspark.sh` | Q4_K_XL | 450K | 6144 | DSpark Q8_0, n-max 3, p-min 0.7 | 20.91 t/s | 267 t/s | 21.9 GB |
+| `scripts/ds4f-q4.sh` (model deleted) | Q4_K_XL | 450K | 6144 | none | 19.25 t/s | 271.6 t/s | 20.7 GB |
+| `scripts/ds4f-q4-dspark.sh` (model deleted) | Q4_K_XL | 450K | 6144 | DSpark Q8_0, n-max 3, p-min 0.7 | 20.91 t/s | 267 t/s | 21.9 GB |
 
-"FP8 dense" (branch `feat/fp8-dense`, see `FP8-HANDOFF.md`): the dense weights DeepSeek ships in FP8 (stored as exact BF16 in the GGUF) are kept in VRAM as FP8 with `-ot ...=CUDA0_FP8`, with output byte-identical to BF16. Q8_K_XL is lossless; Q4_K_XL's dense weights are lossy Q8_0, so Q8_K_XL + FP8 is now the better choice, within ~3% of Q4_K_XL's speed. Model load (Q8_K_XL) is ~82 s to ready, was ~162 s before the loader changes.
+"FP8 dense" (branch `feat/fp8-dense`, see `FP8-HANDOFF.md`): the dense weights DeepSeek ships in FP8 (stored as exact BF16 in the GGUF) are kept in VRAM as FP8 with `-ot ...=CUDA0_FP8`, with output byte-identical to BF16. Q8_K_XL is lossless; Q4_K_XL's dense weights are lossy Q8_0, so Q8_K_XL + FP8 is now the better choice, within ~3% of Q4_K_XL's speed. Model load (Q8_K_XL) is ~82 s to ready, was ~162 s before the loader changes. The Q4_K_XL model and its `~` runners were deleted on 2026-10-24 (copies of the runners stay in `scripts/`).
+
+Same `llama-bench` command as the start of the project (`-p 4096 -n 128 -b 4096 -ub 4096 -ngl 999 -ncmoe 999 -fa on -C 0xFFFFFFFFFFFF --cpu-strict 1 -r 3`, Q8_K_XL):
+
+| build | threads | pp4096 t/s | tg128 t/s |
+|---|---|---|---|
+| master (start) | 16 | 284.2 | 11.04 |
+| now, BF16 dense | 16 / 20 | 284.66 / 284.80 | 16.73 / 17.56 |
+| **now, FP8 dense** | 16 / 20 | 283.40 / 283.79 | **17.82 / 18.69** (1.69x the start at 20 threads) |
+
+Threads with FP8 dense (tg128, 5 runs): 20 = 18.72 +- 0.17, 22 = 18.73, 24 = 18.82; within noise, so the scripts stay at 20 threads (decode is DRAM bound, and the 4 free cores serve the OS, HTTP and the CUDA driver thread).
 
 ### CUDA graph re-recording, CPU/GPU overlap, faster loading
 

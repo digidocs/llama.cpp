@@ -2,6 +2,23 @@
 
 Branch: `feat/fp8-dense` (off `perf/dsv4-flash-profile` at `eddc42ce0`). Fork remote: `mine` = `git@github.com:digidocs/llama.cpp.git` (ask before pushing).
 
+## Morning summary (2026-10-24)
+
+All output byte-identical to the previous build (md5 of every reply). Q8_K_XL with the FP8-origin dense weights stored as FP8 in VRAM:
+
+| | before (17.24 / 19.65 at 350K) | now |
+|---|---|---|
+| Q8, no draft, 450K, 5 prompts x 700 tokens | 17.24 t/s | **18.68 t/s** (+8.4%) |
+| Q8 + DSpark n3/p0.7 | 19.65 t/s at 350K | **20.16-20.23 t/s at 450K** |
+| pp, 9K prompt | 208.8 | 208.6 |
+| dense weights in VRAM | 13.0 GB | 7.6 GB |
+| load to ready | ~76 s | ~82 s |
+
+- `~/ds4f.sh` and `~/ds4f-dspark.sh` use the FP8 storage (`-ot ...=CUDA0_FP8`); the DSpark script is now at 450K. Backups: `~/old-scripts/*.pre-fp8`.
+- Commits on `feat/fp8-dense`: buffer type + BF16 expansion path, native FP8 in mmvf/mmf, fast exact decode + one-warp-per-row kernel, two rows per warp. Not pushed.
+- What did not help (measured, reverted): more warps per row or more rows per warp for long rows; register double-buffering of FP8 loads in `mul_mat_f` (57 -> 71 us, occupancy loss).
+- With DSpark the GPU is only ~18% of a verify step (CPU experts dominate, at the DRAM limit), so further GPU work mostly helps the no-draft path (GPU ~35% of a token). Remaining GPU time per token (no draft, ~19 ms): FP8 matmuls ~8 ms, BF16 `output` head 1.2 ms (at bandwidth), ~2,100 small kernels 5.7 ms (rms_norm 1.0, flash attn 0.7, concat 0.5, ...), `attn_output_a` (mmf) 2.5 ms.
+
 ## Goal
 
 Store the dense weights that DeepSeek shipped as FP8 in 8 bits in VRAM instead of the 16-bit BF16 the GGUF holds them in. That halves the bytes the GPU reads per token for those weights and frees VRAM, with **bit-identical output**.

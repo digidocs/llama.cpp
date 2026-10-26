@@ -750,6 +750,16 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
+            // the shared expert goes into the graph between the expert selection and the routed experts, so it can run
+            // on the GPU while the routed experts run on the CPU
+            ggml_tensor * ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp,   nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+            moe_pre_experts = ffn_shexp;
+
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
@@ -762,13 +772,6 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
                     il);
             cb(moe_out, "ffn_moe_out", il);
-
-            ggml_tensor * ffn_shexp = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, nullptr,
-                    layer.ffn_gate_shexp, nullptr, nullptr,
-                    layer.ffn_down_shexp, nullptr, nullptr,
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(ffn_shexp, "ffn_shexp", il);
 
             cur = ggml_add(ctx0, moe_out, ffn_shexp);
             cb(cur, "ffn_out", il);

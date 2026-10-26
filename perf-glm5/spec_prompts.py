@@ -23,6 +23,10 @@ for i, p in enumerate(prompts):
     tot_n += n; tot_t += ms
     dn += t.get("draft_n", 0) or 0; da += t.get("draft_n_accepted", 0) or 0
     m = r["choices"][0]["message"]
-    md5 = hashlib.md5(((m.get("reasoning_content") or "") + "\n----\n" + (m.get("content") or "")).encode()).hexdigest()[:12]
+    text = (m.get("reasoning_content") or "") + "\n----\n" + (m.get("content") or "")
+    md5 = hashlib.md5(text.encode()).hexdigest()[:12]
+    # REPLY_DIR=<dir> saves each reply as <tag>.p<i>.txt, to find where two runs diverge
+    if os.environ.get("REPLY_DIR"):
+        open(os.path.join(os.environ["REPLY_DIR"], f"{tag}.p{i}.txt"), "w").write(text)
     print(f"{tag} p{i}: {n} tok, {n/ms*1000 if ms else 0:.2f} t/s, draft {t.get('draft_n',0)}/{t.get('draft_n_accepted',0)} acc, pp {t.get('prompt_per_second',0):.0f} t/s, md5 {md5}", flush=True)
 print(f"{tag} TOTAL: {tot_n} tok, {tot_n/tot_t*1000:.2f} t/s" + (f", acceptance {da/dn:.2%} ({da}/{dn})" if dn else ""), flush=True)

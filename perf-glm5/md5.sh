@@ -2,7 +2,7 @@
 # usage: TAG=name [LM=dio] md5.sh [extra server args]; logs to ~/glm5-work/<TAG>.log
 # one 300-token greedy-ish request (seed 1000, reasoning_effort low; md5 covers reasoning + content), prints load time, pp/tg t/s and md5 of the reply
 cd ~/llama.cpp-glm5 && . perf-glm5/common.sh
-export GGML_OP_OFFLOAD_MIN_BATCH=768
+export GGML_OP_OFFLOAD_MIN_BATCH=1400
 L=~/glm5-work/${TAG:-md5}.log; : > $L
 T0=$(date +%s)
 $PREFIX ./build/bin/llama-server -a glm5 -m $M --host 127.0.0.1 --port 8011 --jinja $OFFLOAD \

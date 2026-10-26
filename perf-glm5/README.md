@@ -2,7 +2,8 @@
 
 Xeon Gold 6212U (24 cores, 6ch DDR4-2933, ~122 GB/s measured read) + RTX 3090 (24 GB), 187 GiB RAM.
 Model: `unsloth/GLM-5.3-Flash-GGUF` UD-Q4_K_XL, 200 GB (experts Q4_K/Q5_K/Q6_K 190 GB, everything else Q8_0).
-Launch script: `~/glm53.sh` (port 8001). Logs, references and traces: `~/glm5-work`.
+Launch scripts: `~/glm53.sh` (no MTP, 200K) and `~/glm53-mtp.sh` (MTP, 185K), port 8001. Logs, references and
+traces: `~/glm5-work`.
 
 ## Status
 
@@ -10,25 +11,32 @@ Launch script: `~/glm53.sh` (port 8001). Logs, references and traces: `~/glm5-wo
 |--|--|
 | branch | `glm5-prof` (in `~/llama.cpp-glm5`, a worktree of `~/llama.cpp`) |
 | placement | non-expert weights + MoE layer 3 experts on the GPU, the other 41 MoE layers in pinned host memory (`-ncmoe 999`) |
-| context / ubatch | 200K / 4096 (pp >= 200 t/s needs ubatch 4096; its compute buffer limits the context) |
-| threads | 24 (`--cpu-range 0-23`) |
+| context / ubatch | 200K / 4096 without MTP, 185K / 4096 with MTP (pp >= 200 t/s needs ubatch 4096; its compute buffer limits the context) |
+| threads | 24 (`--cpu-range 0-23`), `--poll` default 50 (0: -0.6%, 100: same) |
 | sampling | GLM defaults: temperature 1.0, top_p 0.95, min_p 0 (DeepSWE: 0.95 / 1.0) |
-| decode | 13.7 t/s without MTP (upstream at 20 threads: 10.7) |
-| prompt | ~210 t/s on an 8.3K-token prompt (server), 242 t/s pp8192 (llama-bench); < 768 tokens stays on the CPU path, ~80 t/s |
+| decode | **14.1 t/s** without MTP, **16.5 t/s** with MTP (upstream at 20 threads: 10.7); 9.9 t/s with MTP at 175K depth |
+| prompt | ~210 t/s on an 8.3K-token prompt, 186 t/s over a 175K-token prompt; < 1400 tokens runs the experts on the CPU, 80-100 t/s |
 | load | ready in ~88 s with `-lm dio` |
 
 ## Branches
 
 - `glm5-base`: upstream master `d854d98ba` (has GLM-5.3-Flash, #27773) + `3ccb12065` parallel loading/pinning + scripts.
   The `unsloth/glm5next/upstream` branch from the model card is outdated: it names the arch `glm5next`, the GGUF says `glm5-next`.
-- `glm5-prof`: glm5-base +
+- `glm5-prof` (current): glm5-base +
   - `45f01bc86` per-thread src1 in CPU MUL_MAT_ID + `GGML_CPU_PROFILE` (`GGML_MMID_NO_PRIVATE_SRC1=1` turns it off)
   - unsloth `aba4a4c1d` chunked indexer re-pooling (no effect here, see below; harmless, md5 unchanged)
-  - `82d47401e` shared expert overlap (scheduler) + the same hook for glm5-next (**built and tested next**)
-- `glm5-ports`: the other ports (CUDA graph per shape/batch size, mmvq src1 reuse) plus two bug fixes that are still
-  missing from the main repo branches: the mmvq src1 cache breaking the VMM pool's LIFO order in the synchronous
-  mul_mat_id fallback (abort in `test-backend-ops -o MUL_MAT_ID`), and the CUDA graph property check not comparing
-  source tensor types (f16 graph replayed on bf16 data, exposed by `c6dc3e41b`).
+  - `82d47401e` shared expert overlap (scheduler) + the same hook for glm5-next
+  - `73fbcf3d4` mmvq src1 reuse, `0ba9fd8b1` / `c6dc3e41b` CUDA graphs per shape / batch size
+  - two bug fixes: the mmvq src1 cache breaking the VMM pool's LIFO order in the synchronous mul_mat_id fallback
+    (abort in `test-backend-ops -o MUL_MAT_ID`), and the CUDA graph property check not comparing source tensor types
+    (f16 graph replayed on bf16 data, exposed by `c6dc3e41b`). Both are also on `~/llama.cpp` perf/dsv4-flash-profile
+    (`bdf564559`, `6e6d0a539`; 18719/18719 ops pass, DSV4 Q8 md5 `1129672c4d2a` unchanged).
+  - `d5680bda6` AVX2 `quantize_row_q8_K` (x86 used the scalar reference): bit-exact (0 mismatched blocks of 1.28M,
+    incl. ties and zero blocks), 27 -> 4.7 us per 16K floats, MUL_MAT_ID quantize 3 -> 0.8 ms per token.
+    Not on the main repo branch yet: DSV4 Q4_K_XL (q4_K experts) would gain from it too.
+- `glm5-ports`: obsolete (the ports are on glm5-prof).
+
+Every glm5-prof change is bit-exact: md5 `3241ffcdeb80`, greedy replies byte-identical, KLD vs the ub 1 reference 0.
 
 ## Correctness references
 
@@ -55,12 +63,15 @@ Launch script: `~/glm53.sh` (port 8001). Logs, references and traces: `~/glm5-wo
 
 Server, 20 threads: 10.70 -> 13.38 t/s, md5 unchanged.
 
-## Where a token goes (24 threads, per-thread src1, 13.6 t/s = 73 ms)
+Later commits (llama-bench tg64, 24 threads): 13.62 (per-thread src1) -> 14.45 t/s (+ shared expert overlap, mmvq
+src1 reuse, CUDA graph commits, AVX2 q8_K). Server, 5 prompts x 400 tokens: 13.67 -> 14.07 t/s before the q8_K change.
+
+## Where a token goes (24 threads, per-thread src1, 13.6 t/s = 73 ms; before the shared expert overlap and AVX2 q8_K)
 
 | part | ms/token | notes |
 |--|--:|--|
 | CPU expert matmul loops | ~41.6 | 41 layers x 8 experts x 15.3 MB = 5.0 GB at ~120 GB/s: at the DRAM ceiling |
-| CPU per-op overhead | ~7.5 | src1 quantize ~3, thread imbalance wait in q4_K MUL_MAT_ID ~3, GLU ~0.75 |
+| CPU per-op overhead | ~7.5 | src1 quantize ~3 (now 0.8, AVX2 q8_K), wait in q4_K MUL_MAT_ID ~3 (threads arriving after the GPU handoff; `--poll 100` does not help), GLU ~0.75 |
 | GPU kernels | ~18.6 | mul_mat_vec_q 11.9 (~9.6 GB dense Q8_0 at ~800 GB/s of 936), quantize_q8_1 0.9, rms_norm 0.9, bin_bcast 0.7, ... |
 | handoffs / launch gaps | ~5 | |
 
@@ -84,15 +95,63 @@ state). The compute buffer grows with ubatch x context (indexer scores and the a
 Long prompts are PCIe bound (~173 GB of host experts streamed per ubatch), so pp scales with ubatch: 512: 43, 1024: 77,
 2048: 140, 4096: 242 t/s.
 
+`GGML_OP_OFFLOAD_MIN_BATCH` (batches below it run the experts on the CPU) crosses over at ~1400 tokens
+(llama-bench, ub 4096, t/s):
+
+| prompt | 512 | 768 | 1024 | 1280 | 1536 | 2048 |
+|--|--:|--:|--:|--:|--:|--:|
+| GPU (stream experts over PCIe) | 42 | 60 | 77 | 94 | **111** | **139** |
+| CPU | **80** | **89** | **96** | **100** | 104 | 108 |
+
+The launch scripts and harness use 1400 (was 768). It also applies to the last, partial ubatch of a long prompt.
+
 unsloth's indexer compute-buffer fix (`aba4a4c1d`, chunked re-pooling) does not help a single slot: 3893 MiB with and
 without it at ub 2048, 863 -> 837 MiB at ub 512. Its gains are for `-np 4` / `--kv-unified` setups.
 
 ## MTP speculative decoding (`--spec-type draft-mtp`)
 
-Needs `--spec-draft-n-ubatch 512` (the default sizes the draft compute buffer like the main context: 5.2 GB).
+Needs a small `--spec-draft-n-ubatch` (the default sizes the draft compute buffer like the main context: 5.2 GB).
 Draft threads: `-td 24 -Crd 0-23 --cpu-strict-draft 1` (the batch-draft CPU options are not enabled in llama-server).
 MTP adds ~1.5 GB of VRAM (MTP weights 191 MiB, recurrent state copies for rollback +291 MiB, draft KV 342 MiB, draft
-compute 680 MiB) and ~4 GB of pinned host memory, which does not fit at 200K / ub 4096: the runs below use 180K.
+compute 680 MiB at draft ub 512 / 180K) and ~4 GB of pinned host memory.
+
+### Final setup (`~/glm53-mtp.sh`): 185K, draft ub 256, q8_0 draft cache, n-max 2, p-min 0.9
+
+Fitting it: `-ctkd q8_0 -ctvd q8_0` (draft cache only; the main cache stays f16) halves the draft KV (342 -> 182 MiB),
+draft ub 256 shrinks the draft compute buffer (939 MiB at ub 512 / 200K). The CUDA pool also needs ~224 MiB above
+the idle level during a 4096 ubatch (sampled with nvidia-smi; the same peak for an 8K and a 175K-token prompt):
+
+| context | draft | idle VRAM | peak in pp | |
+|--|--|--:|--:|--|
+| 200K | ub 512, q8_0 | | | draft compute buffer alloc fails |
+| 200K | ub 256, q8_0, n-max 1 | 24000 | | CUDA OOM in the first prompt |
+| 190K | ub 256, q8_0, n-max 1 | 23568 | 23792 | ok, also with a 174779-token prompt (186 t/s pp, 9.89 t/s tg) |
+| 190K | ub 256, q8_0, n-max 2 | 23714 | 24022 | works, 93 MiB margin: too tight |
+| **185K** | ub 256, q8_0, n-max 2, p-min 0.9 | 23490 | 23798 | chosen, 317 MiB margin |
+
+Draft length (190K, GLM sampling, 5 prompts x 400 tokens, current glm5-prof):
+
+| draft | decode t/s | acceptance |
+|--|--:|--:|
+| no MTP | 14.07 | |
+| n-max 1 | 16.18 | 84.3% |
+| n-max 2 | 15.74 | 71.1% |
+| n-max 3 | 14.07 | 57.0% |
+| n-max 2, p-min 0.6 | 16.31 | 82.3% |
+| n-max 2, p-min 0.8 | 16.52 | 89.0% |
+| **n-max 2, p-min 0.9** | **16.53** | 94.3% |
+| n-max 3, p-min 0.8 | 16.18 | 84.8% |
+| n-max 3, p-min 0.9 | 16.52 | 91.0% |
+
+`--spec-draft-p-min` drafts the next token only when the draft's top probability is at least p-min, so the second
+token is drafted only when it is likely to be accepted. (n-max 1/2/3 rows at 180K with draft ub 512 and f16 draft
+cache; the draft cache type and size did not change acceptance measurably.)
+
+Batched verification numerics: greedy replies with and without MTP diverge after 70-400 characters. KLD vs the ub 1
+reference: ub 2 mean 0.0126 (max 0.50, same top 97.1%), ub 3 mean 0.0106 (same top 96.5%), PPL unchanged within
+noise: the same size as moving one layer between CPU and GPU, i.e. different kernels for 2-3 token batches, not a bug.
+
+### Earlier runs (before the fixes above)
 
 `spec_run.sh`, 5 prompts x 400 tokens, temp 1.0 / top_p 1.0 / min_p 0.01, 180K:
 
@@ -105,9 +164,11 @@ compute 680 MiB) and ~4 GB of pinned host memory, which does not fit at 200K / u
 Every drafted token reads a different set of 8 experts on the CPU, so longer drafts stop paying off sooner than on a
 dense model. pp of the 8.3K-token prompt is unchanged (~210 t/s) except the first prompt after load (~181 t/s).
 
-Pending: greedy correctness (no MTP vs MTP n-max 2), speed with the GLM sampling defaults (no MTP, n-max 1, 2),
-the shared expert overlap, fitting MTP at 200K, variable draft length (`--spec-draft-p-min`, needs the CUDA graph
-per batch size commits from glm5-ports).
+## Not done
+
+- q8_0 KV cache for the main model (ruled out).
+- `--prio 2`: needs root.
+- Reusing the gate/up src1 quantization: < 0.2 ms per token after the AVX2 q8_K.
 
 ## Commands
 
@@ -116,4 +177,6 @@ GGML_CPU_PROFILE=1 ./build/bin/llama-bench -m $M -ngl 999 -ot $GPU_EXPS -ncmoe 9
 nsys profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none -o tg ./build/bin/llama-bench ... -p 0 -n 32
 CTX=180000 MAX_TOKENS=400 perf-glm5/spec_run.sh mtp2 --spec-type draft-mtp --spec-draft-n-ubatch 512 -td 24 -Crd 0-23 --cpu-strict-draft 1 --spec-draft-n-max 2
 GREEDY=1 SKIP_PP=1 perf-glm5/spec_run.sh g-mtp2 ...   # replies saved as ~/glm5-work/<tag>.p<i>.txt
+SKIP_PP=1 PP_ONLY=1 DEEP=620000 perf-glm5/spec_run.sh deep ...   # one ~175K-token prompt (deep_pp.py)
+UB=3 perf-glm5/kld_check.sh cmp ~/glm5-work/base250k-ub1.kld ub3
 ```

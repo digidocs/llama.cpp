@@ -1560,7 +1560,13 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 #define GGML_MMID_PRIVATE_SRC1_MAX (32*1024)
 
 static size_t ggml_mmid_private_src1_size(const struct ggml_tensor * src1, enum ggml_type vec_dot_type) {
-    if (src1->type == vec_dot_type) {
+    // GGML_MMID_NO_PRIVATE_SRC1=1 keeps the shared src1 copy (for A/B comparisons)
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char * env = getenv("GGML_MMID_NO_PRIVATE_SRC1");
+        disabled = env != NULL && atoi(env) != 0;
+    }
+    if (disabled || src1->type == vec_dot_type) {
         return 0;
     }
     const size_t size = ggml_row_size(vec_dot_type, ggml_nelements(src1));

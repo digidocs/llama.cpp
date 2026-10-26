@@ -6,8 +6,8 @@ export GGML_OP_OFFLOAD_MIN_BATCH=768
 L=~/glm5-work/${TAG:-md5}.log; : > $L
 T0=$(date +%s)
 $PREFIX ./build/bin/llama-server -a glm5 -m $M --host 127.0.0.1 --port 8011 --jinja $OFFLOAD \
- --batch-size 2048 --ubatch-size 2048 -c 250000 -np 1 --temp 1.0 --top-p 1.0 --min-p 0.01 -lv 4 -lm ${LM:-dio} \
- --threads 20 --threads-batch 20 --cpu-range 0-19 --cpu-range-batch 0-19 --cpu-strict 1 --cpu-strict-batch 1 "$@" >> $L 2>&1 &
+ --batch-size 4096 --ubatch-size 4096 -c 200000 -np 1 --temp 1.0 --top-p 1.0 --min-p 0.01 -lv 4 -lm ${LM:-dio} \
+ --threads 24 --threads-batch 24 --cpu-range 0-23 --cpu-range-batch 0-23 --cpu-strict 1 --cpu-strict-batch 1 "$@" >> $L 2>&1 &
 PID=$!
 until curl -sf localhost:8011/health >/dev/null; do sleep 2; kill -0 $PID 2>/dev/null || { echo DIED; tail $L; exit 1; }; done
 echo "${TAG:-md5}: ready in $(( $(date +%s)-T0 )) s"

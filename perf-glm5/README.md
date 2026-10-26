@@ -183,6 +183,19 @@ busy is splitting each layer's routed experts between CPU and GPU, with the GPU 
 DRAM is the shared ceiling (~122 GB/s of the 140.8 theoretical): every byte the GPU pulls over PCIe is taken from
 the CPU, so a CPU/GPU expert split cannot speed up decode on this machine.
 
+## Next candidates (paused 2026-10-26)
+
+Remaining token budget (~69 ms at 14.45 t/s): CPU experts ~42 (at the DRAM ceiling), GPU `mul_mat_vec_q` 11.9 (~800
+GB/s, near practical peak), GPU small kernels ~7, CPU thread wait in q4_K MUL_MAT_ID ~3.4, quantize + GLU + handoffs ~4.
+
+1. CPU wait in gate/up MUL_MAT_ID (~3.4 ms/token, 220 ms per 64 tokens in `GGML_CPU_PROFILE`): uneven thread finish
+   at the end of each op (thread 23 does ~15% less chunk work). Try finer final chunks / a different chunk size for
+   small src1. Expect 1-2 ms (+2%); should stay bit-exact.
+2. GPU small-kernel fusion (~2,000 launches per token: rms_norm, k_bin_bcast, quantize_q8_1, scale, unary,
+   dsv4_hc_*): fuse norm -> quantize and add/scale chains. Expect 2-3 ms (+3-4%); several CUDA kernels to touch.
+
+Both together: ~15.2 t/s without MTP, ~17.3 with MTP. Beyond that needs more DRAM bandwidth (see the Rome notes).
+
 ## Not done
 
 - q8_0 KV cache for the main model (ruled out).

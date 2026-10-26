@@ -502,8 +502,66 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 }
 
 // placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+#if defined(__AVX2__)
+    // bit-exact with quantize_row_q8_K_ref: same scale (sign of the first element with the largest |x|),
+    // same product, cvtps rounds to nearest even like nearest_int, |q| <= 127 so the packs do not saturate
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    block_q8_K * GGML_RESTRICT y = vy;
+
+    const __m256 signBit = _mm256_set1_ps(-0.0f);
+    const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    for (int64_t i = 0; i < nb; i++, x += QK_K) {
+        __m256 maxAbs = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K; j += 8) {
+            maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, _mm256_loadu_ps(x + j)));
+        }
+        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(maxAbs, 1), _mm256_castps256_ps128(maxAbs));
+        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        const float amax = _mm_cvtss_f32(max4);
+
+        if (!amax) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, QK_K);
+            memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
+        }
+
+        float max = 0;
+        const __m256 vamax = _mm256_set1_ps(amax);
+        for (int j = 0; j < QK_K; j += 8) {
+            const int m = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(signBit, _mm256_loadu_ps(x + j)), vamax, _CMP_EQ_OQ));
+            if (m) {
+                max = x[j + __builtin_ctz(m)];
+                break;
+            }
+        }
+
+        const float iscale = -127.f/max;
+        const __m256 mul = _mm256_set1_ps(iscale);
+
+        for (int j = 0; j < QK_K; j += 32) {
+            const __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + j +  0), mul));
+            const __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + j +  8), mul));
+            const __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + j + 16), mul));
+            const __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + j + 24), mul));
+
+            y[i].bsums[j/16 + 0] = hsum_i32_8(_mm256_add_epi32(i0, i1));
+            y[i].bsums[j/16 + 1] = hsum_i32_8(_mm256_add_epi32(i2, i3));
+
+            const __m256i q = _mm256_packs_epi16(_mm256_packs_epi32(i0, i1), _mm256_packs_epi32(i2, i3));
+            _mm256_storeu_si256((__m256i *)(y[i].qs + j), _mm256_permutevar8x32_epi32(q, perm));
+        }
+
+        y[i].d = 1/iscale;
+    }
+#else
+    quantize_row_q8_K_ref(x, vy, k);
+#endif
 }
 
 //===================================== Dot products =================================

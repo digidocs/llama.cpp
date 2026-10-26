@@ -164,6 +164,25 @@ noise: the same size as moving one layer between CPU and GPU, i.e. different ker
 Every drafted token reads a different set of 8 experts on the CPU, so longer drafts stop paying off sooner than on a
 dense model. pp of the 8.3K-token prompt is unchanged (~210 t/s) except the first prompt after load (~181 t/s).
 
+## CPU/GPU overlap: measured, no gain (2026-10-26)
+
+Profile of the current build (nsys, `nsys_tg.py`; 79.8 ms/token traced vs ~69 untraced): per CPU MoE layer the GPU
+runs attention/KDA + router (73 kernels, 0.41 ms), hands the router output to the CPU, runs the shared expert during
+the CPU window (the overlap works), then sits idle for the routed experts (~1.1 ms) until the 128 KB result comes
+back. GPU busy 19.8 ms per token. Layer N+1's GPU work needs layer N's expert output, so the only way to keep both
+busy is splitting each layer's routed experts between CPU and GPU, with the GPU reading its share from pinned RAM.
+
+`bw_concurrent.cu` (CPU AVX2 read of 16 GB, optionally while the GPU streams pinned memory):
+
+| | CPU | GPU over PCIe | total |
+|--|--:|--:|--:|
+| CPU alone, 24 threads | 122.5 | | 122.5 GB/s |
+| + H2D copies | 110.3 | 12.3 | 122.6 |
+| + kernel reading mapped host memory | 108.5 | 12.3 | 120.8 |
+
+DRAM is the shared ceiling (~122 GB/s of the 140.8 theoretical): every byte the GPU pulls over PCIe is taken from
+the CPU, so a CPU/GPU expert split cannot speed up decode on this machine.
+
 ## Not done
 
 - q8_0 KV cache for the main model (ruled out).

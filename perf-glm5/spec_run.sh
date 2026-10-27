@@ -3,7 +3,7 @@
 # usage: [OUT=<logdir>] [CTX=200000] spec_run.sh <tag> <extra server args...>   (SKIP_PP=1 / PP_ONLY=1, MAX_TOKENS, GREEDY=1, DEEP=<chars> near-full-context prompt)
 S=${OUT:-$HOME/glm5-work}; HERE=$(cd "$(dirname "$0")" && pwd)
 tag=$1; shift
-cd ~/llama.cpp-glm5 && . perf-glm5/common.sh
+cd "$(dirname "$0")/.." && . perf-glm5/common.sh
 export GGML_OP_OFFLOAD_MIN_BATCH=1400
 ./build/bin/llama-server -a glm5 -m $M --host 127.0.0.1 --port 8011 --jinja $OFFLOAD \
   --batch-size 4096 --ubatch-size 4096 -c ${CTX:-200000} -np 1 --temp 1.0 --top-p 0.95 --min-p 0.0 -lv 4 -lm dio \

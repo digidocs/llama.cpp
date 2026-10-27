@@ -2,6 +2,46 @@
 
 Branch: `perf/dsv4-flash-profile` (based on master `ff5a23376`)
 
+## moe-hybrid: common branch with the GLM-5.3-Flash work (2026-10-27)
+
+Branch `moe-hybrid` (worktree `~/llama.cpp-common`) = `glm5-prof` (upstream `d854d98ba`, 168 commits newer than
+`ff5a23376`) + every commit of this branch except:
+- the 9 commits already on glm5-prof (loading, MXFP4 VNNI + per-thread src1, shared expert overlap, mmvq src1 reuse and
+  its fix, the two CUDA graph keying commits, the graph type check, the HC gate fusion);
+- `3a7caae37` graph head/tail capture: replaced by upstream's chunked graphs (`280141e6d`, `GGML_CUDA_GRAPH_CHUNK_SIZE`,
+  default 512, which never splits the per-layer graphs). Not needed: head/tail on/off 18.96 / 18.98 t/s, chunk size 32
+  19.14 vs 512 19.16. Its premise came from nsys: an `LD_PRELOAD` timer on `cudaGraphLaunch` without nsys gives
+  4.7 us per launch (GLM), not ~55.
+Conflicts: `DSV4_COMP_POOL` next to upstream's new `TOP_K_MASK` op (both kept, `GGML_OP_COUNT` 103) and the FP8 helper
+next to upstream's mmq fusion code. The MUL_MAT_ID queue predicate now mirrors the per-expert path's MXFP4 chunk size.
+Scripts run from their own worktree (`md5_q8.sh`, `md5_q8_dspark.sh`, `spec_run.sh`, `kld_check.sh`, `verify_q8.sh`;
+`MODEL` / `DRAFT` overrides). The 0731 model is deleted; all checks below use DeepSeek-V4-Flash-Vision-Exp UD-Q8_K_XL.
+
+**Outputs change by design: upstream `74bca3950` (#31086, DeepSeek-V4.1) computes softplus as `log1pf(expf(x))`
+instead of `logf(1 + expf(x))`** (CPU and CUDA unary, CUDA top-k MoE sqrt-softplus), which moves the V4 router weights:
+KLD vs this branch 0.0035 (max 0.18, same top 98.4%) at ub 1, 0.0037 at ub 512. Found by `git bisect` over the 168
+upstream commits (KLD vs the ff5a23376 reference). Plain upstream `d854d98ba` with those 3 lines reverted matches this
+branch exactly, and so does moe-hybrid:
+
+| check (Vision-Exp Q8_K_XL, FP8 dense) | result |
+|--|--|
+| moe-hybrid vs plain upstream `d854d98ba`, KLD ub 1 | mean 0, max 3.2e-5, same top 100% (floor) |
+| moe-hybrid with the softplus lines reverted vs this branch | KLD ub 1 / ub 512 at the floor (3.6e-5 / 4.8e-5); md5 BF16 = FP8 `1f9be0c3c752`, FP8 + DSpark `649b5b1f16ab`, same drafts 210/192 |
+| same, `verify_q8.sh` (5 x 700 tokens, no draft and DSpark n3/p0.7 at 450K) | all 10 md5s and the draft counts (1641/1837) identical |
+| `bitexact/` harnesses | comp_pool 120/120, hc_gate and mmvq_reuse fused = unfused (`cmp`) |
+| `test-backend-ops` | 18992/18992 |
+
+Performance (softplus-reverted build, so the drafts are identical; t/s):
+
+| | perf/dsv4-flash-profile | moe-hybrid |
+|--|--:|--:|
+| llama-bench tg128, 3 rounds | 18.96 | **19.16** (+1.1%; MUL_MAT_ID queue off: 19.02) |
+| pp4096 / pp512 (CPU experts) | 288.2 / 79.8 | 288.0 / 79.6 |
+| server no draft, 5 x 700 | 18.72 | **18.94** |
+| server DSpark n3/p0.7 at 450K | 19.61 | **19.89** |
+| server pp, 9K prompt | 206.2 / 206.9 | 206.2 / 206.9 |
+| VRAM after load, no draft / DSpark | 17706 / 18880 MiB | 16736 / 17916 MiB |
+
 Goal: more decode tokens/s for `~/ds4f.sh` (UD-Q8_K_XL, experts MXFP4 on CPU via `-ncmoe 999`, dense BF16/Q8 on the RTX 3090) without losing precision, prompt processing speed, or VRAM (need >= 100K context with MTP).
 
 ## Current status

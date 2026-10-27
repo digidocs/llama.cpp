@@ -40,6 +40,11 @@ traces: `~/glm5-work`.
 
 Every glm5-prof change is bit-exact: md5 `3241ffcdeb80`, greedy replies byte-identical, KLD vs the ub 1 reference 0.
 
+- `moe-hybrid` (in `~/llama.cpp-common`, 2026-10-27): glm5-prof + the DeepSeek branch (FP8 dense, DSV4_COMP_POOL,
+  batched MXFP4 prefill, DSpark scripts); see the top of `perf-dsv4f/README.md`. GLM is unchanged by it: md5
+  `3241ffcdeb80`, KLD ub 1 / ub 512 at the floor, all 5 MTP replies of run 2 identical to production; llama-bench tg128
+  14.95 (glm5-opt 14.96, production glm5-prof build 14.54), MTP server 16.75 / 16.72 (production 16.51 / 16.56).
+
 ## Correctness references
 
 - `md5.sh` (server, one request, seed 1000, reasoning_effort low, 300 tokens, temp 1.0 / top_p 1.0 / min_p 0.01):

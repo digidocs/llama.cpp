@@ -35,6 +35,8 @@ traces: `~/glm5-work`.
     incl. ties and zero blocks), 27 -> 4.7 us per 16K floats, MUL_MAT_ID quantize 3 -> 0.8 ms per token.
     Not on the main repo branch yet: DSV4 Q4_K_XL (q4_K experts) would gain from it too.
 - `glm5-ports`: obsolete (the ports are on glm5-prof).
+- `glm5-opt` (in `~/llama.cpp-glm5opt`, 2026-10-27, not in production yet): glm5-prof + the MUL_MAT_ID work queue and
+  the HC gate fusion, +2.8% decode, bit-exact. See "glm5-opt" below.
 
 Every glm5-prof change is bit-exact: md5 `3241ffcdeb80`, greedy replies byte-identical, KLD vs the ub 1 reference 0.
 
@@ -209,7 +211,65 @@ busy is splitting each layer's routed experts between CPU and GPU, with the GPU 
 DRAM is the shared ceiling (~122 GB/s of the 140.8 theoretical): every byte the GPU pulls over PCIe is taken from
 the CPU, so a CPU/GPU expert split cannot speed up decode on this machine.
 
-## Next candidates (paused 2026-10-26)
+## glm5-opt: MUL_MAT_ID work queue + HC gate fusion (2026-10-27)
+
+Both bit-exact: md5 `3241ffcdeb80`, KLD vs the ub 1 reference and vs a new ub 512 reference (`base-ub512.kld`, made
+with glm5-prof) at the self-compare floor (max 4.0e-5 / 4.8e-5, same top 100%), `test-backend-ops -o MUL_MAT_ID`
+931/931 (CUDA vs CPU), `perf-dsv4f/bitexact/hc_gate.cpp` fused vs `GGML_CUDA_DISABLE_FUSION=1` identical (`cmp`).
+MTP server run 2: all 5 reply md5s identical between glm5-prof and glm5-opt.
+
+`ab_bench.sh` (llama-bench tg128 x 3 per round, configs alternated round by round, 3 rounds; t/s):
+
+| build | tg128 | |
+|--|--:|--|
+| glm5-prof | 14.60 | |
+| + HC gate fusion (`GGML_MMID_QUEUE=0`) | 14.74 | +1.0% |
+| + MUL_MAT_ID queue (glm5-opt) | **15.01** | +2.8% |
+| MTP server, production settings at 185K (2 runs) | 16.65 / 16.53 -> **16.78 / 16.70** | +0.9% |
+
+- **HC gate fusion** (cherry-pick of the DSV4 branch's `50a6407a7`): each hyper-connection gate was 4 kernels
+  (mul, add, sigmoid, scale; 4 gates per layer); now one `dsv4_hc_gate_f32`. ~0.6 ms/token.
+- **MUL_MAT_ID queue**: at decode each expert has one token, and the per-expert path splits it into one fixed chunk per
+  thread (no work stealing), so each op waited for the slowest thread. Experts that would take that path now get a
+  fixed per-thread share in whole 16-row blocks (gate/up 80 of 2048 rows, down 160 of 4096 at 24 threads) and the
+  rest (128 / 256 rows) goes to one queue shared by all threads in 16-row chunks. Per-thread chunk time is now even
+  (2776-2810 ms per 64 tokens across the 24 threads). `GGML_MMID_QUEUE=0` turns it off.
+  The first try (everything in 32-row queue chunks) was **5% slower** than the fixed split (13.94 vs 14.70): short
+  chunks break the long per-thread weight streams. Shares of 75/85/90/95% before the queue: 14.82/14.89/14.90/14.95.
+  The MTP gain is smaller: verify batches give an expert up to 3 tokens and those already had 128 chunks to balance.
+
+Measured, no gain:
+- **swiglu / swiglu_clamp split into column blocks** (8 rows -> 24 threads; bit-exact, 64-float aligned blocks):
+  GLU 47 -> 21 ms per 64 tokens, but the down MUL_MAT_ID's per-thread src1 copy then gathers the GLU output from 24
+  cores instead of 8: src1 quantize 58 -> 92 ms, route+barrier 33 -> 52 ms, tg 14.94 -> 14.84. Reverted. Same
+  effect as behind the per-thread src1 copy: rows written by other cores are expensive to read.
+- `--poll 100`: 14.96 vs 14.94 (noise).
+- CUDA graph launch: nsys shows ~70 us per `cudaGraphLaunch` and a ~80 us GPU gap after every expert handoff, but an
+  `LD_PRELOAD` timer on `cudaGraphLaunch` without nsys gives 4.7 us mean (84 launches per token). Profiler artifact.
+- The shared expert overlap works: the router output goes to the host right after `topk_moe` (early copy), the
+  shared expert runs during the CPU window.
+
+Where a token goes now (15.0 t/s = 66.6 ms): CPU MUL_MAT_ID 45.9 ms (q4_K gate/up at ~108 GB/s, q5_K down at ~112
+GB/s: ~90% of the DRAM ceiling; of it quantize 0.9, route+barrier 0.5), GLU 0.7, GPU ~15 (mul_mat_vec_q ~10,
+~2,400 kernels), handoffs ~5. What is left is small: single-block `rms_norm_f32` over the 4 x 4096 HC rows
+(~0.6 ms/token, splitting it across blocks changes the summation order), `quantize_q8_1` 0.56, `concat_cont` 0.2.
+
+## Layer 3 experts back on the CPU for more context: does not fit in RAM (2026-10-27)
+
+`perf-glm5/l3cpu.sh` (paths hard-coded to `~/llama.cpp-glm5opt`; glm5-opt, `GPU_EXPS` matching nothing, production MTP settings, `-c 280000`, MemAvailable /
+VRAM logged every 5 s to `l3cpu-mem.txt`). Not bit-exact by design (a CPU <-> GPU path change, KLD ~0.012).
+
+- VRAM: fits. 23466 MiB after load, peak 23760 during a 266,734-token prompt (CUDA0: model 8741, context 5701,
+  compute 7323 MiB). The deep prompt ran at 166 t/s pp, 9.87 t/s tg at that depth.
+- RAM: does not fit. Host buffers 184.7 GB (model 181.7 + compute 3.0); MemAvailable fell to ~3 GB at the end of
+  the load and then to 0 for most of the run (210 of 387 samples), with the system swapping. Short-prompt MTP decode
+  15.25 t/s vs 16.7 with layer 3 on the GPU, most likely the swapping, not the extra 4.2 GB of CPU expert reads
+  (expected ~1.5%). No OOM kill in the journal.
+- With layer 3 on the GPU there is ~4 GB of headroom left; moving a 4.2 GB layer to the host needs that plus the
+  3 GB host compute buffer. Would need e.g. a smaller ubatch for the host compute buffer (costs pp) or no `-lm dio`
+  pinning of some layer, neither tried.
+
+## Next candidates (paused 2026-10-26; 1 and part of 2 done on glm5-opt)
 
 Remaining token budget (~69 ms at 14.45 t/s): CPU experts ~42 (at the DRAM ceiling), GPU `mul_mat_vec_q` 11.9 (~800
 GB/s, near practical peak), GPU small kernels ~7, CPU thread wait in q4_K MUL_MAT_ID ~3.4, quantize + GLU + handoffs ~4.

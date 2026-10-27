@@ -2,10 +2,11 @@
 # usage: TAG=name [WHYENV=VAR=1] md5_q4_dspark.sh [extra server args]; logs to ~/dsv4f-work/<TAG>.log
 # one 600-token request with Q4_K_XL + DSpark n3/p0.7, prints t/s, draft counts and md5 of the reply (reference 349af7bedf9c)
 # NOTE: the Q4_K_XL model was deleted on 2026-10-24; use md5_q8.sh / md5_q8_dspark.sh
+B=$(cd "$(dirname "$0")/.." && pwd) # the worktree this script is in
 cd ~
 export GGML_OP_OFFLOAD_MIN_BATCH=768 ${WHYENV:-MD5_TEST=1}
 L=~/dsv4f-work/${TAG:-why}.log; : > $L
-./llama.cpp/build/bin/llama-server -a ds4f \
+$B/build/bin/llama-server -a ds4f \
  --model models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf \
  --host 127.0.0.1 --port 8011 --jinja --n-gpu-layers 999 -ncmoe 999 \
  --batch-size 6144 --ubatch-size 6144 -c 450000 -np 1 --flash-attn on --temp 1.0 --top-p 1.0 --min-p 0.01 -lv 4 -lm dio \

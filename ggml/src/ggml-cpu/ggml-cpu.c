@@ -1613,11 +1613,11 @@ static int64_t ggml_mmid_queue_rows(void) {
 }
 
 // same chunk count as the per-expert path in ggml_compute_forward_mul_mat_id
-static bool ggml_mmid_queued(int64_t nr0, int64_t nr1, int nth, int64_t queue_rows) {
+static bool ggml_mmid_queued(enum ggml_type type, int64_t nr0, int64_t nr1, int nth, int64_t queue_rows) {
     if (queue_rows <= 0 || nr1 == 0 || ggml_is_numa()) {
         return false;
     }
-    const int64_t chunk_size = (nr0 == 1 || nr1 == 1) ? 64 : 16;
+    const int64_t chunk_size = (nr0 == 1 || nr1 == 1 || type == GGML_TYPE_MXFP4) ? 64 : 16;
     const int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
     const int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
     return nchunk0 * nchunk1 < nth * 4;
@@ -1783,7 +1783,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         // too few chunks to balance this expert on its own: its rows go to the shared queue below
-        if (ggml_mmid_queued(ne01, cne1, nth, queue_rows)) {
+        if (ggml_mmid_queued(type, ne01, cne1, nth, queue_rows)) {
             continue;
         }
 
@@ -1872,7 +1872,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         if (ns > 0) {
             for (int a = 0; a < n_as; ++a) {
-                if (!ggml_mmid_queued(nr0, matrix_row_counts[a], nth, queue_rows)) {
+                if (!ggml_mmid_queued(type, nr0, matrix_row_counts[a], nth, queue_rows)) {
                     continue;
                 }
                 const int64_t t_c0 = prof_all ? ggml_time_us() : 0;
@@ -1902,7 +1902,7 @@ static void ggml_compute_forward_mul_mat_id(
                 if (cur_a >= 0) {
                     base += nchunk_e;
                 }
-                for (++cur_a; cur_a < n_as && !ggml_mmid_queued(nr0, matrix_row_counts[cur_a], nth, queue_rows); ++cur_a) {
+                for (++cur_a; cur_a < n_as && !ggml_mmid_queued(type, nr0, matrix_row_counts[cur_a], nth, queue_rows); ++cur_a) {
                 }
             }
             if (cur_a >= n_as) {

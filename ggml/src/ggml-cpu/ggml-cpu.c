@@ -1573,6 +1573,30 @@ static size_t ggml_mmid_private_src1_size(const struct ggml_tensor * src1, enum 
     return size <= GGML_MMID_PRIVATE_SRC1_MAX ? GGML_PAD(size, CACHE_LINE_SIZE) : 0;
 }
 
+// decode (one token per expert) splits each expert into one fixed chunk per thread, so a thread that arrives late or
+// runs slow holds up the barrier; such experts instead get a fixed per-thread share in whole 16-row blocks and the
+// remainder goes to a queue shared by all threads, in 16-row chunks. Returns the queue chunk size, 0 when off
+// (GGML_MMID_QUEUE=0, for A/B comparisons)
+static int64_t ggml_mmid_queue_rows(void) {
+    static int64_t rows = -1;
+    if (rows < 0) {
+        const char * env = getenv("GGML_MMID_QUEUE");
+        rows = env != NULL && atoi(env) == 0 ? 0 : 16;
+    }
+    return rows;
+}
+
+// same chunk count as the per-expert path in ggml_compute_forward_mul_mat_id
+static bool ggml_mmid_queued(int64_t nr0, int64_t nr1, int nth, int64_t queue_rows) {
+    if (queue_rows <= 0 || nr1 == 0 || ggml_is_numa()) {
+        return false;
+    }
+    const int64_t chunk_size = (nr0 == 1 || nr1 == 1) ? 64 : 16;
+    const int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+    const int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+    return nchunk0 * nchunk1 < nth * 4;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1629,8 +1653,8 @@ static void ggml_compute_forward_mul_mat_id(
     struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
-        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as + 1], the last one for the shared queue
+        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * (n_as + 1), CACHE_LINE_SIZE);
 
     // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
     // reservation is unconditional, the per expert eligibility is decided at dispatch time
@@ -1713,8 +1737,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    const int64_t queue_rows = ggml_mmid_queue_rows();
+
     // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+    for (int cur_a = ith; cur_a <= n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
         *current_chunk_ctr = nth;
     }
@@ -1727,6 +1753,11 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+
+        // too few chunks to balance this expert on its own: its rows go to the shared queue below
+        if (ggml_mmid_queued(ne01, cne1, nth, queue_rows)) {
             continue;
         }
 
@@ -1796,6 +1827,77 @@ static void ggml_compute_forward_mul_mat_id(
             }
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    // the experts skipped above: fixed shares, then the shared queue. Every row is computed by the same vec_dot
+    // calls, only the thread differs, so the result is unchanged
+    if (queue_rows > 0) {
+        const void * wdata = (src1->type == vec_dot_type) ? src1->data : private_src1 ? private_src1 : params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+        const int64_t nr0 = ne01;
+
+        // fixed shares: rows [ith*ns, (ith + 1)*ns) of every queued expert, long contiguous weight streams per thread
+        const int64_t ns       = (nr0/nth) & ~(queue_rows - 1);
+        const int64_t nr0_q    = nr0 - nth*ns; // rows per expert left for the queue
+        const int64_t nchunk_e = (nr0_q + queue_rows - 1) / queue_rows; // chunks per expert
+
+        if (ns > 0) {
+            for (int a = 0; a < n_as; ++a) {
+                if (!ggml_mmid_queued(nr0, matrix_row_counts[a], nth, queue_rows)) {
+                    continue;
+                }
+                const int64_t t_c0 = prof_all ? ggml_time_us() : 0;
+                ggml_compute_forward_mul_mat_id_one_chunk(
+                    dst, src0, src1, ids, a,
+                    ith*ns, (ith + 1)*ns, 0, matrix_row_counts[a],
+                    (const char *) src0->data + a*nb02, matrix_rows, row_size, src1_cont, wdata
+                );
+                if (prof_all) {
+                    t_mine += ggml_time_us() - t_c0;
+                }
+                if (prof) {
+                    ggml_cpu_prof_mmid[4] += ggml_time_us() - t_c0;
+                    ggml_cpu_prof_mmid[5] += ns*matrix_row_counts[a];
+                }
+            }
+        }
+
+        atomic_int * queue_ctr = (atomic_int *)(atomic_current_chunk + n_as);
+
+        int     cur_a = -1; // expert of chunks [base, base + nchunk_e)
+        int64_t base  = 0;
+
+        for (int64_t w = ith; ; w = atomic_fetch_add_explicit(queue_ctr, 1, memory_order_relaxed)) {
+            // advance to the queued expert that holds chunk w; w only grows, so the walk resumes where it was
+            while (cur_a < n_as && (cur_a < 0 || w >= base + nchunk_e)) {
+                if (cur_a >= 0) {
+                    base += nchunk_e;
+                }
+                for (++cur_a; cur_a < n_as && !ggml_mmid_queued(nr0, matrix_row_counts[cur_a], nth, queue_rows); ++cur_a) {
+                }
+            }
+            if (cur_a >= n_as) {
+                break;
+            }
+
+            const int64_t ir0_start = nth*ns + (w - base)*queue_rows;
+            const int64_t ir0_end   = MIN(ir0_start + queue_rows, nr0);
+
+            const int64_t t_c0 = prof_all ? ggml_time_us() : 0;
+            ggml_compute_forward_mul_mat_id_one_chunk(
+                dst, src0, src1, ids, cur_a,
+                ir0_start, ir0_end, 0, matrix_row_counts[cur_a],
+                (const char *) src0->data + cur_a*nb02, matrix_rows, row_size, src1_cont, wdata
+            );
+            if (prof_all) {
+                t_mine += ggml_time_us() - t_c0;
+            }
+            if (prof) {
+                ggml_cpu_prof_mmid[4] += ggml_time_us() - t_c0;
+                ggml_cpu_prof_mmid[5] += (ir0_end - ir0_start)*matrix_row_counts[cur_a];
+            }
         }
     }
 
@@ -2992,7 +3094,7 @@ struct ggml_cplan ggml_graph_plan(
                         // matrix_rows
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
-                        cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        cur += CACHE_LINE_SIZE*(n_as + 1) + CACHE_LINE_SIZE;
                         // Workspace for tiled (see tiled.h)
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);

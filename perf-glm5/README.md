@@ -14,7 +14,7 @@ traces: `~/glm5-work`.
 | context / ubatch | 200K / 4096 without MTP, 185K / 4096 with MTP (pp >= 200 t/s needs ubatch 4096; its compute buffer limits the context) |
 | threads | 24 (`--cpu-range 0-23`), `--poll` default 50 (0: -0.6%, 100: same) |
 | sampling | GLM defaults: temperature 1.0, top_p 0.95, min_p 0 (DeepSWE: 0.95 / 1.0) |
-| decode | **14.1 t/s** without MTP, **16.5 t/s** with MTP (upstream at 20 threads: 10.7); 9.9 t/s with MTP at 175K depth |
+| decode | **14.1 t/s** without MTP, **16.5 t/s** with MTP (upstream at 20 threads: 10.7); with MTP at 64K depth 15.3 (13.45 before the k-pool layout fix), 9.9 at 175K before it |
 | prompt | ~210 t/s on an 8.3K-token prompt, 186 t/s over a 175K-token prompt; < 1400 tokens runs the experts on the CPU, 80-100 t/s |
 | load | ready in ~88 s with `-lm dio` |
 
@@ -163,6 +163,32 @@ noise: the same size as moving one layer between CPU and GPU, i.e. different ker
 
 Every drafted token reads a different set of 8 experts on the CPU, so longer drafts stop paying off sooner than on a
 dense model. pp of the 8.3K-token prompt is unchanged (~210 t/s) except the first prompt after load (~181 t/s).
+
+## MTP at depth: k-pool layout rebuild (2026-10-26)
+
+With MTP, decode fell with depth (server, `~/prof/depthprof.py`, 600 tokens: 15.39 t/s at 0, 13.45 at 64K) while
+llama-bench without MTP stayed flat (13.53 -> 13.37 at 131K). CPU expert time was constant (~39 ms/token); the extra
+~9 ms was the other 23 threads spinning in the libgomp barrier. nsys (`~/prof/nsyscmp.py n0 n64k`) put only ~1.9
+ms/token of it on the GPU (lightning_indexer 18 -> 95 us per launch, flash_attn 16 -> 64 us, sparse index/top-k,
+draft cache q8_0 -> f16 dequant 118 us). The rest was the main thread in `std::_Rb_tree_increment` (~8% of its time at
+64K, none at depth 0).
+
+Cause: the server drops rejected drafts with a `seq_rm` after every verify step, which marks the sequence stale from
+p0, and `llama_memory_hybrid_idx::kpool_layout_update()` rebuilt the whole layout on any stale mark: it walked the
+sequence's whole `seq_pos` set and rescanned every pool. Without MTP there is no `seq_rm`. Fix: for an edit at
+p0 > pos_min, keep the cells below p0 and the pools that end before it, resume the scan after the last kept pool and
+append the tail from the set. An edit at pos_min or a cell count mismatch still rebuilds fully.
+
+| depth | before | after |
+|--|--:|--:|
+| 0 | 15.39 t/s (264/290 drafts) | 15.20 (259/281) |
+| 64K | 13.45 (265/277) | **15.30** (269/286) |
+
+Checked with a temporary assertion that rebuilt the layout the old way after every update and compared cells, pools,
+scan position and pos_min: 1024+ checks, 652 through the trimmed path (MTP decode at 16K plus prompt cache reuse that
+trims at ~12K and re-prefills ~4K), no mismatch. Greedy output cannot be compared token for token: two runs of the same
+build diverge after ~70 tokens (batched verification numerics, see above). Not exercised: order mode (qwen4exp),
+`-np` > 1, `seq_add`.
 
 ## CPU/GPU overlap: measured, no gain (2026-10-26)
 

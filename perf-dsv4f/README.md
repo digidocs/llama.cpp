@@ -400,6 +400,16 @@ The shared expert (3 x 4096x2048 BF16 per layer, ~2.2 GB/token) could run on the
 - Memory speed: already ~87% of the theoretical DDR4-2933 rate (122 of 140.8 GB/s).
 - Lower precision for dense weights: against the precision requirement.
 
+## DeepSeek-V4-Flash-Vision-Exp (2026-10-26)
+Same architecture and settings as 0731, run with `scripts/dsv4v.sh` (no draft) and `scripts/dsv4v-dspark.sh` (DSpark n-max 3, p-min 0.7). Model is unsloth UD-Q8_K_XL plus `mmproj-BF16.gguf` (both in `models/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF`); the FP8 `-ot`, `-lm dio` and 450K context carry over unchanged.
+
+- unsloth publishes no drafter, so it is built from DeepSeek's checkpoint (only the 3 `mtp.*` shards, ~11 GB, are fetched; the output is a 10.9 GB Q8_0 GGUF):
+  `convert_hf_to_gguf.py --remote deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --dspark --target-model-dir <HF snapshot dir> --outtype q8_0 --outfile <model dir>/dspark-DeepSeek-V4-Flash-Vision-Exp-Q8_0.gguf`
+  `--target-model-dir` is required (the tokenizer comes from it) and the run only fails at the very end without it. The snapshot dir is the one the converter prints and caches under `~/.cache/huggingface/hub`; the cache can be deleted afterwards.
+- The converter needs torch; it was run from a venv (`~/.venvs/convert`, `requirements-convert_hf_to_gguf.txt` + `gguf-py`). With transformers 4.57.6 it logs "does not recognize `deepseek_v4`" and falls back to `config.json`; the output loads and drafts fine. transformers 5.x has the model type but is outside the requirements pin; not tried.
+- Checked 2026-10-26 (single short requests, not a benchmark): text 19.4 t/s with 171/191 draft tokens accepted; an image request (left half red, right half green) is described correctly, so the mmproj works, 19.7 t/s with 72/79 accepted. Quality beyond that was not checked.
+- The server needs port 8001, the whole GPU and most of the RAM, so stop the GLM and ds4f servers first.
+
 ## Housekeeping
 - `build-swap/` (non-OpenMP libggml-cpu, stale) is scratch; the other scratch builds were deleted. Non-OpenMP has not been retested since the private-src1 fix.
 - The `-lm none` load takes ~150 s; use `moe_real` and `test-backend-ops perf` for iteration and the full `llama-bench` only to confirm.

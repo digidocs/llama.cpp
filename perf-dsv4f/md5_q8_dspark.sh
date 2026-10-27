@@ -6,8 +6,8 @@ cd ~
 export GGML_OP_OFFLOAD_MIN_BATCH=768
 L=~/dsv4f-work/${TAG:-why8}.log; : > $L
 $PREFIX $B/build/bin/llama-server -a ds4f \
- --model models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
- --host 127.0.0.1 --port 8011 --jinja --n-gpu-layers 999 -ncmoe 999 --batch-size 4096 --ubatch-size 4096 -c 450000 -md models/unsloth/DeepSeek-V4-Flash-0731-GGUF/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 3 --spec-draft-p-min 0.7 --spec-draft-n-ubatch 512 -ngld 999 -ncmoed 999 -td 20 -tbd 20 --cpu-range-draft 0-19 -Cbd 0xFFFFF --cpu-strict-draft 1 -np 1 \
+ --model ${MODEL:-models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf} \
+ --host 127.0.0.1 --port 8011 --jinja --n-gpu-layers 999 -ncmoe 999 --batch-size 4096 --ubatch-size 4096 -c 450000 -md ${DRAFT:-models/unsloth/DeepSeek-V4-Flash-0731-GGUF/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf} --spec-type draft-dspark --spec-draft-n-max 3 --spec-draft-p-min 0.7 --spec-draft-n-ubatch 512 -ngld 999 -ncmoed 999 -td 20 -tbd 20 --cpu-range-draft 0-19 -Cbd 0xFFFFF --cpu-strict-draft 1 -np 1 \
  --flash-attn on --temp 1.0 --top-p 1.0 --min-p 0.01 -lv 4 -lm ${LM:-dio} \
  --threads 20 --threads-batch 20 --cpu-range 0-19 --cpu-range-batch 0-19 --cpu-strict 1 --cpu-strict-batch 1 "$@" >> $L 2>&1 &
 PID=$!

@@ -9,7 +9,7 @@ traces: `~/glm5-work`.
 
 | setting | value |
 |--|--|
-| branch | `moe-hybrid` (in `~/llama.cpp-common`, a worktree of `~/llama.cpp`); glm5-prof is merged into it and its worktree removed |
+| branch | `moe-hybrid` in `~/llama.cpp` (glm5-prof is merged into it; its worktree and `~/llama.cpp-common` are removed) |
 | placement | non-expert weights + MoE layer 3 experts on the GPU, the other 41 MoE layers in pinned host memory (`-ncmoe 999`) |
 | context / ubatch | 200K / 4096 without MTP, 185K / 4096 with MTP (pp >= 200 t/s needs ubatch 4096; its compute buffer limits the context) |
 | threads | 24 (`--cpu-range 0-23`), `--poll` default 50 (0: -0.6%, 100: same) |
@@ -40,7 +40,7 @@ traces: `~/glm5-work`.
 
 Every glm5-prof change is bit-exact: md5 `3241ffcdeb80`, greedy replies byte-identical, KLD vs the ub 1 reference 0.
 
-- `moe-hybrid` (in `~/llama.cpp-common`, 2026-10-27, production: `~/glm53*.sh`, `~/ds4f*.sh` and `~/dsv4v*.sh` use its build): glm5-prof + the DeepSeek branch (FP8 dense, DSV4_COMP_POOL,
+- `moe-hybrid` (2026-10-27, checked out in `~/llama.cpp`, production: `~/glm53*.sh`, `~/ds4f*.sh` and `~/dsv4v*.sh` use its build): glm5-prof + the DeepSeek branch (FP8 dense, DSV4_COMP_POOL,
   batched MXFP4 prefill, DSpark scripts); see the top of `perf-dsv4f/README.md`. GLM is unchanged by it: md5
   `3241ffcdeb80`, KLD ub 1 / ub 512 at the floor, all 5 MTP replies of run 2 identical to production; llama-bench tg128
   14.95 (glm5-opt 14.96, production glm5-prof build 14.54), MTP server 16.75 / 16.72 (production 16.51 / 16.56).

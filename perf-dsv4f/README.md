@@ -1,10 +1,10 @@
 # DeepSeek-V4-Flash-0731 decode performance notes
 
-Branch: `perf/dsv4-flash-profile` (based on master `ff5a23376`). Production runs `moe-hybrid` (below); the launch scripts use `./llama.cpp-common/build`.
+Branch: `perf/dsv4-flash-profile` (based on master `ff5a23376`). Production runs `moe-hybrid` (below), checked out in `~/llama.cpp`.
 
 ## moe-hybrid: common branch with the GLM-5.3-Flash work (2026-10-27)
 
-Branch `moe-hybrid` (worktree `~/llama.cpp-common`) = `glm5-prof` (upstream `d854d98ba`, 168 commits newer than
+Branch `moe-hybrid` (`~/llama.cpp`; built first in a worktree `~/llama.cpp-common`) = `glm5-prof` (upstream `d854d98ba`, 168 commits newer than
 `ff5a23376`) + every commit of this branch except:
 - the 9 commits already on glm5-prof (loading, MXFP4 VNNI + per-thread src1, shared expert overlap, mmvq src1 reuse and
   its fix, the two CUDA graph keying commits, the graph type check, the HC gate fusion);

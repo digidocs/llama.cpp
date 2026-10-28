@@ -1,6 +1,6 @@
 # DeepSeek-V4-Flash-0731 decode performance notes
 
-Branch: `perf/dsv4-flash-profile` (based on master `ff5a23376`)
+Branch: `perf/dsv4-flash-profile` (based on master `ff5a23376`). Production runs `moe-hybrid` (below); the launch scripts use `./llama.cpp-common/build`.
 
 ## moe-hybrid: common branch with the GLM-5.3-Flash work (2026-10-27)
 

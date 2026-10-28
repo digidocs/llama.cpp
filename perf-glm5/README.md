@@ -9,7 +9,7 @@ traces: `~/glm5-work`.
 
 | setting | value |
 |--|--|
-| branch | `glm5-prof` (in `~/llama.cpp-glm5`, a worktree of `~/llama.cpp`) |
+| branch | `moe-hybrid` (in `~/llama.cpp-common`, a worktree of `~/llama.cpp`); glm5-prof is merged into it and its worktree removed |
 | placement | non-expert weights + MoE layer 3 experts on the GPU, the other 41 MoE layers in pinned host memory (`-ncmoe 999`) |
 | context / ubatch | 200K / 4096 without MTP, 185K / 4096 with MTP (pp >= 200 t/s needs ubatch 4096; its compute buffer limits the context) |
 | threads | 24 (`--cpu-range 0-23`), `--poll` default 50 (0: -0.6%, 100: same) |
@@ -263,7 +263,7 @@ GB/s: ~90% of the DRAM ceiling; of it quantize 0.9, route+barrier 0.5), GLU 0.7,
 
 ## Layer 3 experts back on the CPU for more context: does not fit in RAM (2026-10-27)
 
-`perf-glm5/l3cpu.sh` (paths hard-coded to `~/llama.cpp-glm5opt`; glm5-opt, `GPU_EXPS` matching nothing, production MTP settings, `-c 280000`, MemAvailable /
+`perf-glm5/l3cpu.sh` (glm5-opt, `GPU_EXPS` matching nothing, production MTP settings, `-c 280000`, MemAvailable /
 VRAM logged every 5 s to `l3cpu-mem.txt`). Not bit-exact by design (a CPU <-> GPU path change, KLD ~0.012).
 
 - VRAM: fits. 23466 MiB after load, peak 23760 during a 266,734-token prompt (CUDA0: model 8741, context 5701,

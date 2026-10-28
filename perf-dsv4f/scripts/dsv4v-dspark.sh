@@ -9,7 +9,7 @@ MODEL_DIR=models/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF
 #   python3 llama.cpp/convert_hf_to_gguf.py --remote deepseek-ai/DeepSeek-V4-Flash-Vision-Exp --dspark \
 #     --target-model-dir <snapshot dir it prints> --outtype q8_0 --outfile $MODEL_DIR/dspark-DeepSeek-V4-Flash-Vision-Exp-Q8_0.gguf
 
-./llama.cpp/build/bin/llama-server  \
+./llama.cpp-common/build/bin/llama-server  \
 -a Deepseek-V4-Flash-Vision-Exp --model $MODEL_DIR/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00001-of-00005.gguf --mmproj $MODEL_DIR/mmproj-BF16.gguf \
 --host 0.0.0.0 --port 8001 --jinja --n-gpu-layers 999 -ncmoe 999 \
 --batch-size 4096 --ubatch-size 4096 -c 450000 -np 1 \

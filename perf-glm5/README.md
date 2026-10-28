@@ -35,15 +35,17 @@ traces: `~/glm5-work`.
     incl. ties and zero blocks), 27 -> 4.7 us per 16K floats, MUL_MAT_ID quantize 3 -> 0.8 ms per token.
     Not on the main repo branch yet: DSV4 Q4_K_XL (q4_K experts) would gain from it too.
 - `glm5-ports`: obsolete (the ports are on glm5-prof).
-- `glm5-opt` (in `~/llama.cpp-glm5opt`, 2026-10-27, not in production yet): glm5-prof + the MUL_MAT_ID work queue and
-  the HC gate fusion, +2.8% decode, bit-exact. See "glm5-opt" below.
+- `glm5-opt` (2026-10-27, merged into glm5-prof and deleted with its worktree): glm5-prof + the MUL_MAT_ID work queue
+  and the HC gate fusion, +2.8% decode, bit-exact. See "glm5-opt" below.
 
 Every glm5-prof change is bit-exact: md5 `3241ffcdeb80`, greedy replies byte-identical, KLD vs the ub 1 reference 0.
 
-- `moe-hybrid` (in `~/llama.cpp-common`, 2026-10-27): glm5-prof + the DeepSeek branch (FP8 dense, DSV4_COMP_POOL,
+- `moe-hybrid` (in `~/llama.cpp-common`, 2026-10-27, production: `~/glm53*.sh`, `~/ds4f*.sh` and `~/dsv4v*.sh` use its build): glm5-prof + the DeepSeek branch (FP8 dense, DSV4_COMP_POOL,
   batched MXFP4 prefill, DSpark scripts); see the top of `perf-dsv4f/README.md`. GLM is unchanged by it: md5
   `3241ffcdeb80`, KLD ub 1 / ub 512 at the floor, all 5 MTP replies of run 2 identical to production; llama-bench tg128
   14.95 (glm5-opt 14.96, production glm5-prof build 14.54), MTP server 16.75 / 16.72 (production 16.51 / 16.56).
+  Load test of `glm53-mtp.sh` at 185K (8K prompt = two 4096 ubatches, then 200 tokens): peak VRAM 23798 MiB vs 23818
+  on the old build; `dsv4v-dspark.sh` at 450K: peak 19396 MiB.
 
 ## Correctness references
 

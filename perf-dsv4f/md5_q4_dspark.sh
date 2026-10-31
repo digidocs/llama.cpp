@@ -5,7 +5,7 @@
 B=$(cd "$(dirname "$0")/.." && pwd) # the worktree this script is in
 cd ~
 export GGML_OP_OFFLOAD_MIN_BATCH=768 ${WHYENV:-MD5_TEST=1}
-L=~/dsv4f-work/${TAG:-why}.log; : > $L
+mkdir -p ~/dsv4f-work; L=~/dsv4f-work/${TAG:-why}.log; : > $L
 $B/build/bin/llama-server -a ds4f \
  --model models/unsloth/DeepSeek-V4-Flash-0731-GGUF/UD-Q4_K_XL/DeepSeek-V4-Flash-0731-UD-Q4_K_XL-00001-of-00005.gguf \
  --host 127.0.0.1 --port 8011 --jinja --n-gpu-layers 999 -ncmoe 999 \

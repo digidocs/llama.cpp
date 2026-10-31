@@ -1,7 +1,7 @@
 #!/bin/bash
 # server A/B for speculative decoding: ~8K-token pp check (spec_pp.py) + 5 decode prompts with md5s (spec_prompts.py)
 # usage: [OUT=<logdir>] [CTX=200000] spec_run.sh <tag> <extra server args...>   (SKIP_PP=1 / PP_ONLY=1, MAX_TOKENS, GREEDY=1, DEEP=<chars> near-full-context prompt)
-S=${OUT:-$HOME/glm5-work}; HERE=$(cd "$(dirname "$0")" && pwd)
+S=${OUT:-$HOME/glm5-work}; HERE=$(cd "$(dirname "$0")" && pwd); mkdir -p "$S"
 tag=$1; shift
 cd "$(dirname "$0")/.." && . perf-glm5/common.sh
 export GGML_OP_OFFLOAD_MIN_BATCH=1400

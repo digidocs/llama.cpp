@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: OUT=<logdir> spec_run.sh <tag> <extra server args...>
-S=${OUT:-/tmp}; HERE=$(cd "$(dirname "$0")" && pwd)
+S=${OUT:-/tmp}; HERE=$(cd "$(dirname "$0")" && pwd); mkdir -p "$S"
 tag=$1; shift
 B=$(cd "$(dirname "$0")/.." && pwd) # the worktree this script is in
 cd ~

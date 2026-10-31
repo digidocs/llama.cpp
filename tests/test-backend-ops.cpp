@@ -12154,7 +12154,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int hs : { 128, 256, }) {
         for (int nr2 : { 1, 6, }) {
             for (int kv : { 512, 4352, }) {
-                for (int nb : { 2, 3, 4, 8, 16, }) {
+                for (int nb : { 1, 2, 3, 4, 8, 16, }) {
                     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
                         test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
                     }

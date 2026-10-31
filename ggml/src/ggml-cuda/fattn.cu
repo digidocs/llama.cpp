@@ -651,7 +651,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
-                    if (Q->ne[1] == 1) {
+                    // MMA reads q8_0 K/V once per GQA group, vec reads it once per Q head.
+                    // RTX 3090, gqa 6, D 256: equal at 4k KV, MMA +29% at 112k
+                    const bool mma_q8_0 = gqa_opt_applies && gqa_ratio >= 4 && K->ne[1] >= 4096 &&
+                        ggml_cuda_flash_attn_ext_mma_f16_use_q8_0(dst);
+                    if (Q->ne[1] == 1 && !mma_q8_0) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }

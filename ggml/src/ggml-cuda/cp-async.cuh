@@ -45,6 +45,23 @@ static __device__ __forceinline__ void cp_async_cg_16(const unsigned int dst, co
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// Copies 4, 8 or 16 bytes, for data that is not 16 byte aligned. Both pointers must be aligned to the copy size.
+template <int nbytes>
+static __device__ __forceinline__ void cp_async_ca(const unsigned int dst, const void * src) {
+    static_assert(nbytes == 4 || nbytes == 8 || nbytes == 16, "bad nbytes");
+#ifdef CP_ASYNC_AVAILABLE
+    if constexpr (nbytes == 16) {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" : : "r"(dst), "l"(src));
+    } else {
+        asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" : : "r"(dst), "l"(src), "n"(nbytes));
+    }
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // Makes each thread wait until its asynchronous data copies are done.
 // This does NOT provide any additional synchronization.
 // In particular, when copying data with multiple warps a call to __syncthreads will be needed.

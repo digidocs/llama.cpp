@@ -103,8 +103,9 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         inp_embd = inp->embd;
         res->t_inp_embd = inp->embd;
 
-        inp->h = build_inp_embd_state(inp.get(), n_embd_backbone);
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_backbone, ubatch.n_tokens);
         cb(inp->h, "inp_h", -1);
+        ggml_set_input(inp->h);
         inp_h = inp->h;
 
         res->add_input(std::move(inp));

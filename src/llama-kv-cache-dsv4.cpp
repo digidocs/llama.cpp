@@ -1290,8 +1290,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
-    rs_idx(n_seq_max, 0),
-    rs_max(n_seq_max, 0) {
+    rs_idx(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1675,8 +1674,12 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return res;
         }
 
+        if (n_rs_seq == 0) {
+            return false;
+        }
+
         const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) rs_max[seq_id]) {
+        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
             return false;
         }
 
@@ -1716,7 +1719,6 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
 
     if (seq_id_src != seq_id_dst) {
         rs_idx[seq_id_dst] = 0;
-        rs_max[seq_id_dst] = 0;
     }
 }
 
@@ -1861,10 +1863,8 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
         rs_idx[seq_id] = 0;
-        rs_max[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
-        std::fill(rs_max.begin(), rs_max.end(), 0);
     }
 }
 
@@ -1908,30 +1908,18 @@ const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
     return rs_idx;
 }
 
-void llama_kv_cache_dsv4::update_rs_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
+void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
     if (n_rs_seq == 0) {
         return;
     }
 
-    std::vector<uint32_t> n_seq_tokens(n_seq_max);
-
     for (const llama_ubatch & ubatch : ubatches) {
-        std::fill(n_seq_tokens.begin(), n_seq_tokens.end(), 0);
-
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][s];
                 if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
-                    n_seq_tokens[seq_id]++;
+                    rs_idx[seq_id] = 0;
                 }
-            }
-        }
-
-        // the ubatch consumes any pending rollback and leaves snapshots for its own tokens only
-        for (uint32_t seq_id = 0; seq_id < n_seq_max; ++seq_id) {
-            if (n_seq_tokens[seq_id] > 0) {
-                rs_idx[seq_id] = 0;
-                rs_max[seq_id] = std::min(n_seq_tokens[seq_id], n_rs_seq);
             }
         }
     }
@@ -1967,10 +1955,8 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
 
     if (seq_id >= 0) {
         rs_idx[seq_id] = 0;
-        rs_max[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
-        std::fill(rs_max.begin(), rs_max.end(), 0);
     }
 }
 
@@ -2305,7 +2291,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()),
     kv(kv) {
-    kv->update_rs_for_ubatches(this->ubatches);
+    kv->reset_rs_idx_for_ubatches(this->ubatches);
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;

@@ -13522,6 +13522,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Qwen3.8-Flash-Next routed experts (512 experts, 10 used): merged gate_up and down
+    for (int64_t n_tokens : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 1280, n_tokens, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+    }
+
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }

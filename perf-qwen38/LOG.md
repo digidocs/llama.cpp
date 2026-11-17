@@ -180,3 +180,8 @@ AVX2 q8_K quantize (d5680bda6): irrelevant for Q8_0 experts (src1 is quantized t
   Patch to apply it only when a thread's mask changes (`~/qwen38-work/affinity-once.patch`, env
   GGML_CPU_AFFINITY_EVERY_GRAPH=1 for the old path): greedy 33.34 vs 33.20 t/s, md5 identical. Within noise: reverted.
 - Server hang: llama-server ignored SIGINT for ~5 min after a /completion request; SIGTERM worked. Scripts use SIGTERM.
+
+### 20:00 full native context: -c 262144, MTP Q8_0 n3, --spec-draft-n-ubatch 512 (`spec_run.sh c262k-q8`, greedy)
+- Fits: VRAM 22142 MiB (~2.4 GB free). Main KV 6144 + indexer 1536 MiB, main compute buffer 5086 MiB (2778 at 131K),
+  draft compute 349 MiB (1768 with the inherited ub 4096), draft KV 512 + 128 MiB.
+- pp 9145 tok: 293.3 / 298.4 t/s. Decode total 32.82 t/s (33.23 at 131K), md5 of all 5 replies identical to 131K.

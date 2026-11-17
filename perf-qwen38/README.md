@@ -80,6 +80,8 @@ With MTP the branches converge: every step verifies 4 tokens, and that batch is 
 perf-qwen38/ab_bench.sh 2 base=$HOME/llama.cpp-qwen38-base new=$HOME/llama.cpp-qwen38   # llama-bench tg A/B
 GREEDY=1 perf-qwen38/spec_run.sh <tag> -md $MTP_DIR/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-type draft-mtp -ngld 99 --spec-draft-n-max 3
 CTX=262144 SKIP_PP=1 DEEP=830000 perf-qwen38/spec_run.sh <tag> ...   # ~230K-token prompt
-~/qwen38-work/prof/run_prof.sh <tag> ...    # nsys (node trace) + GGML_CPU_PROFILE
-~/qwen38-work/prof/run_perf.sh <tag> ...    # perf LBR call graphs (needs kernel.perf_event_paranoid <= 1)
+perf-qwen38/run_prof.sh <tag> ...    # nsys (node trace) + GGML_CPU_PROFILE
+perf-qwen38/run_perf.sh <tag> ...    # perf LBR call graphs (needs kernel.perf_event_paranoid <= 1)
+perf-qwen38/run_prof_graph.sh <tag> ...  # nsys graph-level trace; then: nsys export --type sqlite -o x.sqlite x.nsys-rep
+python3 -I perf-qwen38/timeline.py x.sqlite 60                          # per-layer CPU/GPU hand-off timeline
 ```

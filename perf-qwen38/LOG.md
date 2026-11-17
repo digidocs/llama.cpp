@@ -185,3 +185,11 @@ AVX2 q8_K quantize (d5680bda6): irrelevant for Q8_0 experts (src1 is quantized t
 - Fits: VRAM 22142 MiB (~2.4 GB free). Main KV 6144 + indexer 1536 MiB, main compute buffer 5086 MiB (2778 at 131K),
   draft compute 349 MiB (1768 with the inherited ub 4096), draft KV 512 + 128 MiB.
 - pp 9145 tok: 293.3 / 298.4 t/s. Decode total 32.82 t/s (33.23 at 131K), md5 of all 5 replies identical to 131K.
+
+### 20:15 deep prompt at full context (`CTX=262144 SKIP_PP=1 DEEP=830000 spec_run.sh c262k-q8-deep`, greedy)
+- 260576-token prompt (llama.cpp sources; code is ~3.2 chars/token, not 3.6: 830K chars nearly filled the 262144 window).
+- pp **334.8 t/s** over the whole prompt (778 s; 357 t/s at 49K, 343 at 180K). Decode at that depth 23.19 t/s over
+  64 tokens, MTP acceptance 58% (40/69). VRAM 22142 MiB throughout, no errors.
+- The 5 short prompts afterwards: 32.89 t/s, md5 identical to the 131K and 262K runs.
+- The reply was not saved (deep_pp.py printed timings only); it now writes `<tag>.deep.txt`. Coherence at depth not yet checked.
+- Server: "prompt state size 8743.516 MiB exceeds cache size limit 8192.000 MiB, skipping" (host prompt cache, -cram).

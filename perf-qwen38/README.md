@@ -22,7 +22,8 @@ Launch script: `~/qwen4exp-mtp.sh` (port 8001). Experiment log with every run: `
 
 - `020bbcb6b` MTP draft borrows the target's embeddings and lm head (unsloth 78ede59e3)
 - `0d3f7180a` parallel model loading + faster pinned allocation (moe-hybrid adddcd17a); `~/llama.cpp-qwen38-base` is a
-  frozen build of this commit for A/B
+  frozen build of this commit for A/B (removed 2026-11-16; recreate with
+  `git worktree add --detach ~/llama.cpp-qwen38-base 0d3f7180a` and the same cmake line)
 - moe-hybrid ports: `d949e0e00` per-thread src1 + work queue in CPU MUL_MAT_ID + `GGML_CPU_PROFILE`, `41ca29ee4` / `4a4765d58`
   mmvq src1 reuse, `a8de3d3d6` / `846f02e67` CUDA graphs per shape / batch size, `9705f4e75` graph check compares src types,
   `2c6f64cbc` k-pool layout tail rebuild, `862fc39ac` shared expert overlap (+ qwen4exp hook)

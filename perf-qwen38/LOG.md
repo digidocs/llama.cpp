@@ -193,3 +193,13 @@ AVX2 q8_K quantize (d5680bda6): irrelevant for Q8_0 experts (src1 is quantized t
 - The 5 short prompts afterwards: 32.89 t/s, md5 identical to the 131K and 262K runs.
 - The reply was not saved (deep_pp.py printed timings only); it now writes `<tag>.deep.txt`. Coherence at depth not yet checked.
 - Server: "prompt state size 8743.516 MiB exceeds cache size limit 8192.000 MiB, skipping" (host prompt cache, -cram).
+
+### 20:40 real agent session (user's server, ~/qwen4exp-mtp.sh, n-max 3, temp 1.0): 20 requests, context 6K -> 51K
+- 27863 tokens generated at 26.9 t/s (24.4-35.3 per request). Acceptance per draft position on long generations
+  ~0.70 / 0.50 / 0.37 (worst 0.63 / 0.45 / 0.31), lower than the test prompts: the 3rd draft token is below break-even.
+  -> run script now n-max 2 (estimated equal to +2-3% on long generations; not A/B'd on this workload yet).
+- Prompt chunks < 1400 tokens ran the experts on the CPU (57-127 t/s); 1050 tokens took 8.45 s, 1370 tokens 10.8 s.
+  GPU offload chunks: 1475 tokens 8.5 s, 1879-1981 tokens 8.9 s (~7.6 s fixed + ~0.7 ms/token). Crossover ~1030-1100:
+  -> GGML_OP_OFFLOAD_MIN_BATCH 1400 -> 1100 in both run scripts (saves ~1-2 s on 1100-1400 token chunks).
+- One request hit a reasoning budget of 8192 tokens ("budget exhausted, forcing end sequence"): set by the client, not the server.
+- No errors; 3 context checkpoint restores (112.6 MiB each).

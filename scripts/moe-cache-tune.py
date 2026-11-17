@@ -562,11 +562,14 @@ def tune(cmd, out, max_mib):
 
     n = 2 * len(CALIB_SHARES)
     small = rnd(0.10 * expert_mib(model))
+    if max_mib:
+        # the first run must fit too, e.g. with a draft model the tuner does not measure
+        small = min(small, rnd(max_mib / 2))
     runs = [run_server(cmd, out, small, 0.0, N_FIRST, 1, f"1/{n}", warm)]
     host, dev, free, used = device_room(open(os.path.join(out, f"run-{small}-0.log"), errors="replace").read())
     room = int(free - used - 512)
     cap = min(max_mib, room) if max_mib else room
-    large = rnd(min(0.30 * host, room))
+    large = rnd(min(0.30 * host, cap))
     if large <= small:
         sys.exit(f"no room on {dev} for a cache larger than {small} MiB")
     for i, (mib, share) in enumerate([(small, s) for s in CALIB_SHARES[1:]] + [(large, s) for s in CALIB_SHARES]):

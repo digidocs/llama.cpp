@@ -106,3 +106,29 @@ AVX2 q8_K quantize (d5680bda6): irrelevant for Q8_0 experts (src1 is quantized t
 - VRAM 17.1 GB. pp 9145 tok: 292.2 / 298.0 t/s.
 - p0..p4: 35.10 / 29.24 / 34.51 / 27.14 / 30.74, **total 31.37 t/s**, acceptance 64.27% (2148/3342). No MTP: 24.80.
 - commit b41230589 qwen4exp: build the MTP k-pool input only for a QSA block
+
+### 18:20 reference: guide branch danielhanchen/llama.cpp qwen4exp/mtp (6fcaa16f4, Sep 21), worktree ~/llama.cpp-dh-mtp
+- MTP Q8_0 n-max 3 (`spec_run.sh dh-mtp-q8-n3`): total 31.67 t/s, acceptance 64.54%, md5 of all 5 replies identical to ours.
+- llama-bench tg128 (no MTP): 18.96 t/s. Ours 25.76, master 16.12.
+- So the ports help n=1 decode a lot but nothing with MTP: the verify batch (up to 4 tokens) runs the CPU mul_mat_id
+  path the ports don't speed up (micro-bench gate_up n=3: 741 us ported vs 733 no-private). Next target: small-batch MUL_MAT_ID.
+
+### 18:45 why do the branches differ at n=1 but not with MTP?
+- llama-bench batch times (ms per batch, -p 1,2,3,4 -r 20): ours 40.0 / 58.4 / 72.3 / 87.3, guide 60.8 / 76.6 / 87.5 / 99.5.
+- Server MTP steps (p4, from print_timing): ~3.0 drafted per step, so 4-token verify batches. 93.0 ms/step ours,
+  92.4 ms/step guide. A step = verify + 3 MTP draft passes on the GPU (~6 ms), so verify is ~87 ms on both trees.
+- So in steady-state decode both trees verify 4 tokens in ~87 ms (near DRAM bandwidth). The guide's llama-bench pp
+  numbers carry ~8-12 ms of per-run overhead its tg128 doesn't (guide pp1 60.8 ms vs its tg128 52.7 ms; ours 40.0 vs 38.8).
+  Inference, not a direct measurement: GGML_CPU_PROFILE isn't in the guide tree.
+- The ports' real win is only 1-token decode (CPU mul_mat_id at n=1); n>=2 was already efficient upstream (micro-bench agrees).
+- Unexplained: master 16.12 vs guide 18.96 at tg128 (newer master, possible decode regression). Matters only without MTP.
+- Use server step time, not llama-bench pp, to compare verify cost across trees.
+
+### 18:55 MoE cache: dead end on this machine (PCIe 3.0 x16, ~13 GB/s vs ~112 GB/s CPU reads)
+- Fixed scripts/moe-cache-tune.py: both calibration sizes now respect --max-mib (the first run used 10% of the experts,
+  12224 MiB, and ran out of VRAM with the MTP draft loaded, which the tuner doesn't measure).
+- Tuner run 1 (2944 MiB, CPU share 0, every miss uploaded): 4.8 t/s. Killed by my 590 s timeout; the full tuner doesn't
+  fit a foreground call at this speed.
+- Direct test, MTP Q8_0 n-max 3 + `--moe-cache-mib 6000 --moe-cache-cpu-share 0.95`: total 31.83 t/s (vs 31.37 without),
+  acceptance 63.0%, VRAM 23.1 GB. Within noise, eats the VRAM that context needs, and changes the replies (hits run on
+  the GPU), so it would need a KLD check too. Not pursued.

@@ -132,3 +132,51 @@ AVX2 q8_K quantize (d5680bda6): irrelevant for Q8_0 experts (src1 is quantized t
 - Direct test, MTP Q8_0 n-max 3 + `--moe-cache-mib 6000 --moe-cache-cpu-share 0.95`: total 31.83 t/s (vs 31.37 without),
   acceptance 63.0%, VRAM 23.1 GB. Within noise, eats the VRAM that context needs, and changes the replies (hits run on
   the GPU), so it would need a KLD check too. Not pursued.
+
+### 19:00 draft length: MTP Q8_0 n-max 2 (`spec_run.sh mtp-q8-n2`)
+- p0..p4 30.58 / 32.82 / 32.79 / 28.47 / 33.30, **total 31.68 t/s**, acceptance 74.3% (1971/2654). n-max 3: 31.37.
+- Per step: n2 ~2.49 tokens in ~79 ms, n3 ~2.93 tokens in ~93 ms; the same tokens per ms. Draft length isn't a lever.
+- Note: at temperature 1.0 the replies differ between configs, so per-prompt speeds wobble ~+-10%; use GREEDY=1 for tighter A/B.
+
+### 19:10 profile of steady-state MTP decode (Q8_0 head, n-max 3, greedy), `~/qwen38-work/prof/run_prof.sh mtp-n3`
+- Drafter is fully on the GPU (50/50 layers, 2.6 GB CUDA0 weights + its KV). Its compute buffer is 1.77 GB because the draft
+  context inherits ub 4096: `--spec-draft-n-ubatch` should free ~1.5 GB of VRAM.
+- Run: 1500 tokens, 30.07 t/s, acceptance 68.1%, mean accepted length 3.04. Capture: 20 s, ~205 steps, ~97 ms/step under nsys.
+- CPU (GGML_CPU_PROFILE, whole run): MUL_MAT_ID 95.6% of CPU op time (~63 ms/step), GET_ROWS q8_0 4.0% (0.46 ms/call,
+  ~2.7 ms/step; which table? likely the lazy PLE), everything else < 0.5%.
+- GPU (nsys, 20 s): kernels 1.99 s total, so the GPU is busy ~10% (~9.7 ms/step). Top: mmvq q8_0 ncols 4 (44.6%, the 4-token
+  verify), mmvq ncols 1 (13.6%, drafts), quantize_q8_1 4.5%, GDN 3.4%. Memcpy H2D 179 ms + D2H 60 ms (~1.2 ms/step).
+- CUDA API (host): cudaGraphLaunch 10276 calls (~50/step) avg 97 us (inflated by --cuda-graph-trace=node), cudaStreamSynchronize
+  29336 calls (~143/step) avg 24 us, cudaEventSynchronize ~26/step avg 225 us (waiting on GPU work).
+- Per-step budget (~93 ms unprofiled): CPU experts ~63, GPU kernels ~10, copies ~1, CPU GET_ROWS ~3, launch+sync overhead
+  ~5-8, unexplained host time ~10 (graph build / sched / sampling?; needs perf).
+
+### 19:20 perf (LBR call graphs, 15 s of MTP decode, all threads; `~/qwen38-work/prof/run_perf.sh mtp-n3`): 32.34 t/s
+- On-CPU samples: ggml_vec_dot_q8_0_q8_0 66.6%, libgomp 31.1% (mostly the OpenMP team spinning between parallel
+  regions while the main thread drives the GPU; some ggml_barrier -> GOMP_barrier), kernel 0.9%, libcuda 0.9%.
+- Host-side llama/ggml work (graph build, sched split, allocator, sampling, seq_rm) is < 0.2% in total: not a target.
+- Combined with GGML_CPU_PROFILE (CPU graph wall 68.7 ms/step) and nsys (GPU kernels ~10 ms/step): of a ~93 ms step,
+  ~24 ms is outside the CPU graphs; ~10 ms of that is GPU compute, the other ~14 ms is CPU<->GPU hand-off latency
+  (~50 graph launches, ~143 stream syncs, ~26 event syncs per step, i.e. ~2 hand-offs per layer). At n=1 the same
+  non-CPU time is ~17.6 ms, so it is mostly a fixed per-layer cost, not proportional to batch size.
+
+### 19:30 hand-off latency, step 1: async host -> device input copies
+- nsys graph-level timeline (`~/qwen38-work/prof/g-n3.sqlite`, `timeline.py`): a verify layer is ~2.4 ms: CPU experts ~1840 us,
+  GPU graph 250-410 us, CPU->GPU hand-off ~130 us (H2D 400 KB 35 us + blocking stream sync 37 us + cudaGraphLaunch 50-90 us),
+  GPU->CPU ~20 us. Verify graph: 98 splits (49 GPU/CPU round trips); draft graphs 2 splits.
+- Cause of the blocking sync: CPU -> CUDA copies fail cpy_tensor_async (device-to-device only) and fall back to
+  ggml_backend_tensor_copy. Now queued with set_tensor_async when the source is host memory (the CPU compute buffer is
+  pinned CUDA_Host). GGML_SCHED_SYNC_H2D=1 restores the old path.
+- Greedy 5 prompts, MTP Q8_0 n3: sync 32.63 t/s, async **33.23 t/s (+1.8%)**, md5 of all 5 replies identical.
+- commit 589e6576f ggml-backend : sched queues host -> device input copies instead of waiting
+
+### 19:45 dead ends: CUDA graphs off, PLE page faults, per-graph thread affinity
+- GGML_CUDA_DISABLE_GRAPHS=1 (greedy): 32.37 t/s vs 33.23 with graphs (cudaGraphLaunch costs 54-58 us per layer, but
+  per-kernel launches cost more). Graphs stay on.
+- PLE GET_ROWS: 0 major and 0 minor page faults over 600 tokens (/proc/PID/stat), so the slow CPU GET_ROWS q8_0
+  (0.46 ms/call) is not disk reads of the lazy 51 GB table. Not yet explained.
+- perf kernel samples (0.9% of all): 66% native_queued_spin_lock_slowpath, from pthread_setaffinity_np in
+  ggml_graph_compute's OpenMP region (affinity re-applied for all 24 threads on every CPU graph, ~50 per step).
+  Patch to apply it only when a thread's mask changes (`~/qwen38-work/affinity-once.patch`, env
+  GGML_CPU_AFFINITY_EVERY_GRAPH=1 for the old path): greedy 33.34 vs 33.20 t/s, md5 identical. Within noise: reverted.
+- Server hang: llama-server ignored SIGINT for ~5 min after a /completion request; SIGTERM worked. Scripts use SIGTERM.

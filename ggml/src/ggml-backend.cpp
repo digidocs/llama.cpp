@@ -2153,7 +2153,17 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         } else {
             ggml_backend_synchronize(split_backend);
         }
-        ggml_backend_tensor_copy(input, input_cpy);
+        // host -> device: queue the upload on the split backend instead of waiting for it, the split's
+        // compute is queued after it on the same stream. Later splits on the host wait for the split
+        // backend before they run, so the host memory is not reused before the upload is done.
+        static const bool sync_h2d = getenv("GGML_SCHED_SYNC_H2D") != NULL;
+        ggml_backend_buffer_t buf_src = input->view_src ? input->view_src->buffer : input->buffer;
+        if (!sync_h2d && split_backend->iface.set_tensor_async && buf_src && ggml_backend_buffer_is_host(buf_src) &&
+            ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
+            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+        } else {
+            ggml_backend_tensor_copy(input, input_cpy);
+        }
     }
 }
 

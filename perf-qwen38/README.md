@@ -16,6 +16,7 @@ Launch script: `~/qwen4exp-mtp.sh` (port 8001). Experiment log with every run: `
 | sampling | model card thinking mode: temperature 1.0, top_p 0.95, top_k 20, min_p 0 |
 | decode | **~31.5 t/s** with MTP at temperature 1.0 (33.2 greedy), 24.8 without MTP; upstream master 16.1 without MTP, crashes with MTP |
 | prompt | ~295 t/s on a 9K-token prompt (b = ub = 4096, `GGML_OP_OFFLOAD_MIN_BATCH=1400`) |
+| at depth | 260576-token prompt: pp 334.8 t/s (13 min), then decode 23.2 t/s with MTP (64 tokens) |
 | reference | Qwen3.8-27B Q5_K_M MTP on the same 5 prompts: 67.3 t/s (dense model, fits in VRAM) |
 
 ## Branch `qwen38-flash-next`
